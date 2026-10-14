@@ -44,6 +44,10 @@ PIECES = {
 }
 
 
+TRACK_DRIFT = 0.03    # s, std of the beat tracker's slow error
+TRACK_JITTER = 0.015  # s, its per-beat error
+
+
 # ------------------------------------------------------------------ ground truth
 
 class TruthNote:
@@ -155,15 +159,20 @@ def perform(truth, bpm, rng, rubato=0.12, scatter=0.018, spread=0.012, hand_lag=
 
 # ------------------------------------------------------------------ scoring
 
-def run(name, seed, verbose=False):
+HARD = dict(rubato=0.25, scatter=0.03, spread=0.02, hand_lag=0.025)  # a freer player
+
+
+def run(name, seed, verbose=False, hard=False):
     src, bpm, bars = PIECES[name]
     rng = np.random.default_rng(seed)
     truth = generate(src[4:], bars, rng) if src.startswith("gen:") else from_corpus(src, bars)
-    notes, beat_times, truth_of = perform(truth, bpm, rng)
-    tracked = beat_times + rng.normal(0, 0.012, len(beat_times))  # a tracker is never exact
-    idx = np.arange(len(tracked), dtype=float)
-    beat_of = lambda t: float(np.interp(t, tracked, idx, left=(t - tracked[0]) / (tracked[1] - tracked[0])))
-    hands = tr.quantize(notes, beat_of)
+    notes, beat_times, truth_of = perform(truth, bpm, rng, **(HARD if hard else {}))
+    # a tracker is never exact: a slowly wandering error plus a small one per beat
+    drift = np.convolve(rng.normal(0, 1, len(beat_times) + 8), np.hanning(7), "same")[4:4 + len(beat_times)]
+    drift = drift / (drift.std() + 1e-9) * TRACK_DRIFT
+    tracked = beat_times + drift + rng.normal(0, TRACK_JITTER, len(beat_times))
+    grid, n_pre = tr.extend_beats(tracked, max(n.end for n in notes))
+    hands, _ = tr.quantize(notes, grid, n_pre)
 
     placed = {}
     for side, events in hands.items():
@@ -199,7 +208,7 @@ def main():
     rows = []
     print(f"{'piece':10} {'notes':>6} {'hand':>7} {'onset':>7} {'grace':>7}")
     for name in names:
-        rs = [run(name, s, verbose) for s in seeds]
+        rs = [run(name, s, verbose, "--hard" in sys.argv) for s in seeds]
         r = {k: float(np.mean([x[k] for x in rs])) for k in rs[0]}
         rows.append(r)
         print(f"{name:10} {r['notes']:6.0f} {r['hand']:7.1%} {r['onset']:7.1%} {r['grace']:7.1%}")

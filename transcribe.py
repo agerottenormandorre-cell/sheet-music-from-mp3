@@ -50,14 +50,19 @@ HELD_MARGIN = 0.06     # a key released this soon after an onset no longer binds
 OCTAVE_TIME = 0.15     # s: the fastest leap is about an octave in this time
 STREAM_DT = 0.3        # s: consecutive onsets closer than this form a line
 BEAM = 48
-BEAM = 48
+REFIT_ROUNDS = 2       # quantize, move the beats to the notes, quantize again
+REFIT_WIDTH = 1.125    # beats: how far around a beat its notes count
+REFIT_FIT = 0.2        # beats: only onsets this close to their grid position count
+REFIT_MAX = 0.15       # of a beat: largest correction per round
+SYNC_WINDOW = 0.05     # s: onsets of both hands closer than this were played together
 # Quantization is a likelihood: onsets scatter around the grid with TIMING_SIGMA
 # (measured on real playing: ~0.05 beat), finer grids pay a prior penalty.
-TIMING_SIGMA = 0.05
-SUBDIVISIONS = [(1, 0.0), (2, 0.5), (4, 1.2), (3, 2.0), (8, 3.5), (6, 3.5)]
-SWITCH_PENALTY = 2.0         # switching between duple (16ths) and triple (triplets) grids
-COLLISION_PENALTY = 4.0      # two onsets forced onto one grid slot (-> grace note)
-ROLL_SIGMA = 0.035           # s: typical spread of a rolled chord / melody played after its chord
+TIMING_SIGMA = 0.078
+SUBDIVISIONS = [(1, 0.0), (2, 0.5), (4, 1.5), (3, 0.96), (8, 7.0), (6, 3.3), (5, 3.2), (7, 4.5)]
+FAST_GRID = 1.013      # a grid of n >= 5 per beat only where the hand plays faster than FAST_GRID / n
+SWITCH_PENALTY = 0.72        # switching between duple (16ths) and triple (triplets) grids
+COLLISION_PENALTY = 6.25     # two onsets forced onto one grid slot (-> grace note)
+ROLL_SIGMA = 0.044           # s: typical spread of a rolled chord / melody played after its chord
 UNCERTAIN = 0.09             # beats off the grid: such notes are colored for checking by ear
 UNCERTAIN_COLOR = "#C2185B"
 LEGATO_GAP = Fraction(1, 2)  # rests shorter than this (in beats) are absorbed into the note
@@ -316,7 +321,8 @@ def quantize_hand(events):
         # finer than 16ths only where the hand really plays faster than 16ths
         fastest = min(min(e.ioi for e in evs), getattr(evs[0], "ioi_in", math.inf))
         for si, (sub, penalty) in enumerate(SUBDIVISIONS):
-            if (sub == 8 and fastest > 0.17) or (sub == 6 and fastest > 0.20):
+            # grids of 5+ only for fast notes; odd tuplets only when the beat has (nearly) that many notes
+            if (sub >= 5 and fastest > FAST_GRID / sub) or (sub in (5, 7) and len(evs) < sub - 1):
                 costs[b - b0, si] = np.inf
                 continue
             slots, cost = assign_slots(evs, fr, sub)
@@ -492,11 +498,10 @@ def hand_features(groups, assignment):
     return f
 
 
-def hand_events(notes, beat_of):
-    """Split chords between hands; per hand a time-ordered list of Events."""
+def hand_events(hand_notes, beat_of):
+    """Per hand a time-ordered list of Events from the (left, right) note lists per group."""
     hands = {"L": [], "R": []}
-    groups = group_onsets(notes)
-    for g, (lh, rh) in zip(groups, assign_hands(groups)):
+    for lh, rh in hand_notes:
         for side, hn in (("L", lh), ("R", rh)):
             if hn:
                 t0 = float(np.mean([n.start for n in hn]))
@@ -504,10 +509,90 @@ def hand_events(notes, beat_of):
     return hands
 
 
-def quantize(notes, beat_of):
-    """Performance notes + beat mapping -> {"L"/"R": quantized Events}."""
-    hands = hand_events(notes, beat_of)
-    return {side: quantize_hand(evs) if evs else [] for side, evs in hands.items()}
+def refit_beats(hands, grid, origin):
+    """Move each beat to where the quantized notes around it say it is.
+
+    Every placed onset is a (score position, time) pair; around each beat a weighted
+    straight line through these pairs gives the beat's time. Only onsets on beats and
+    half beats that fitted well count, and the correction is limited, so a wrong
+    quantization cannot pull the beats after it."""
+    # anchors: onsets on beats and half beats that fitted the grid well
+    pts = np.array([(float(e.q) + origin, e.time) for evs in hands.values() for e in evs
+                    if abs(e.pos - float(e.q)) < REFIT_FIT and (e.q * 2).denominator == 1])
+    if len(pts) < 4:
+        return grid
+    new = grid.copy()
+    ibi = np.diff(grid)
+    for i in range(len(grid)):
+        w = np.exp(-0.5 * ((pts[:, 0] - i) / REFIT_WIDTH) ** 2)
+        near = w > 0.1
+        if w.sum() < 3 or not near.any() or np.ptp(pts[near, 0]) < 0.5:
+            continue
+        x, y = pts[:, 0] - i, pts[:, 1]
+        sw, sx, sy = w.sum(), (w * x).sum(), (w * y).sum()
+        sxx, sxy = (w * x * x).sum(), (w * x * y).sum()
+        det = sw * sxx - sx * sx
+        if det <= 1e-9:
+            continue
+        a = (sxx * sy - sx * sxy) / det  # fitted time at the beat
+        step = ibi[min(i, len(ibi) - 1)]
+        new[i] = grid[i] + np.clip(a - grid[i], -REFIT_MAX * step, REFIT_MAX * step)
+    # keep the beats in order
+    for i in range(1, len(new)):
+        new[i] = max(new[i], new[i - 1] + 0.1 * ibi[min(i - 1, len(ibi) - 1)])
+    return new
+
+
+def align_hands(hands):
+    """Onsets the two hands played together get the same score position.
+
+    Of two such onsets the one that sits worse on its grid moves to the other's
+    position, if that keeps its own hand in order. Returns how many moved."""
+    moved = 0
+    left, right = hands["L"], hands["R"]
+    j = 0
+    for e in left:
+        while j < len(right) and right[j].time < e.time - SYNC_WINDOW:
+            j += 1
+        k = j
+        while k < len(right) and right[k].time <= e.time + SYNC_WINDOW:
+            r = right[k]
+            if r.q != e.q:
+                # the one whose own grid has the other's position moves; if both do,
+                # the worse fitted one
+                fits_e = (r.q * e.sub).denominator == 1
+                fits_r = (e.q * r.sub).denominator == 1
+                if fits_e != fits_r:
+                    e_moves = fits_e
+                else:
+                    e_moves = abs(e.pos - float(e.q)) > abs(r.pos - float(r.q))
+                a, b, own = (e, r, left) if e_moves else (r, e, right)
+                i = own.index(a)
+                lo = own[i - 1].q if i > 0 else None
+                hi = own[i + 1].q if i + 1 < len(own) else None
+                if (lo is None or lo < b.q) and (hi is None or b.q < hi):
+                    a.q, a.sub = b.q, b.sub
+                    moved += 1
+            k += 1
+    return moved
+
+
+def quantize(notes, grid, origin, hand_notes=None):
+    """Performance notes + beat times -> ({"L"/"R": quantized Events}, refined beat times).
+
+    grid[i] is the time of beat i; score position 0 is beat `origin`. Hands are
+    assigned once; quantization and beat refitting then alternate REFIT_ROUNDS times."""
+    if hand_notes is None:
+        hand_notes = assign_hands(group_onsets(notes))
+    for rnd in range(REFIT_ROUNDS + 1):
+        idx = np.arange(len(grid), dtype=float)
+        beat_of = lambda t, g=grid: float(np.interp(t, g, idx)) - origin
+        hands = {side: quantize_hand(evs) if evs else []
+                 for side, evs in hand_events(hand_notes, beat_of).items()}
+        align_hands(hands)
+        if rnd < REFIT_ROUNDS:
+            grid = refit_beats(hands, grid, origin)
+    return hands, grid
 
 
 # ------------------------------------------------------------------ engraving
@@ -584,7 +669,9 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         origin -= bar
     beat_of = lambda t: to_beat(t) - origin
 
-    hands = quantize(notes, beat_of)
+    hands, grid = quantize(notes, grid, origin)
+    to_beat = lambda t: float(np.interp(t, grid, idx))
+    beat_of = lambda t: to_beat(t) - origin
 
     last_end = max(max(e.q + max(Fraction(round(e.end_pos * 2), 2) - e.q, Fraction(1, e.sub)) for e in h)
                    for h in hands.values() if h)
