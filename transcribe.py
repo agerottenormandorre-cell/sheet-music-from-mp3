@@ -41,6 +41,16 @@ BEAT_FPS = 50          # Beat This! frame rate
 DP_FPS = 100           # resolution of the beat DP
 CHORD_WINDOW = 0.035   # s: onsets closer than this are one chord
 HAND_SPAN = 14         # semitones one hand covers comfortably
+# hand separation (beam search): feature weights learned by bench/train_hands.py
+HAND_WEIGHTS = {"span": 25.4, "finger": 20.0, "move_fast": 0.202, "move": 0.255, "move_any": 0.378,
+                "jump": 1.868, "cross_enter": 0.106, "crossed": 0.611, "reg_left": 0.347, "reg_right": 0.234,
+                "touching": 0.015, "stream_step": 0.183, "stream_near": 0.178, "switch": 0.317, "rhythm": 0.663}
+MIN_DT = 0.03
+HELD_MARGIN = 0.06     # a key released this soon after an onset no longer binds the hand
+OCTAVE_TIME = 0.15     # s: the fastest leap is about an octave in this time
+STREAM_DT = 0.3        # s: consecutive onsets closer than this form a line
+BEAM = 48
+BEAM = 48
 # Quantization is a likelihood: onsets scatter around the grid with TIMING_SIGMA
 # (measured on real playing: ~0.05 beat), finer grids pay a prior penalty.
 TIMING_SIGMA = 0.05
@@ -361,6 +371,145 @@ def quantize_hand(events):
     return out
 
 
+class HandState:
+    """Where one hand is: centre and time of its last onset, keys it still holds down,
+    time between its last two onsets."""
+    __slots__ = ("c", "t", "held", "ioi")
+
+    def __init__(self, c, t, held, ioi=None):
+        self.c, self.t, self.held, self.ioi = c, t, held, ioi
+
+
+class Terms(dict):
+    def __missing__(self, key):
+        return 0.0
+
+
+def hand_step(state, notes, t, f):
+    """One hand plays `notes` (pretty_midi) at time t: adds its features to f, returns its next state."""
+    pitches = [n.pitch for n in notes]
+    held = [n for n in state.held if n.end > t + HELD_MARGIN]
+    keys = pitches + [n.pitch for n in held]
+    f["span"] += max(0, max(keys) - min(keys) - HAND_SPAN) ** 2
+    f["finger"] += max(0, len(set(keys)) - 5)
+    c = float(np.mean(pitches))
+    ioi = None
+    if state.t is not None:
+        dt = max(t - state.t, MIN_DT)
+        octaves = abs(c - state.c) / 12
+        f["move_fast"] += octaves * min(1.0, 0.15 / dt)
+        f["move"] += octaves * min(1.0, 0.5 / dt)
+        f["move_any"] += octaves
+        f["jump"] += max(0.0, octaves - dt / OCTAVE_TIME) ** 2
+        ioi = dt
+        if state.ioi is not None and max(dt, state.ioi) < 1.0:
+            # a hand's figuration tends to keep its pace
+            f["rhythm"] += min(2.0, abs(math.log2(dt / state.ioi)))
+    return HandState(c, t, held + list(notes), ioi)
+
+
+def hands_step(L, R, last, t, lh, rh, f):
+    """Both hands at one onset group: adds the features of this step to f.
+    `last` is (time, [(pitch, hand)], hand of a single-hand group or None)."""
+    nl = hand_step(L, lh, t, f) if lh else L
+    nr = hand_step(R, rh, t, f) if rh else R
+    crossed = nl.c > nr.c + 1
+    f["cross_enter"] += crossed and not (L.c > R.c + 1)
+    if lh:  # register and crossing count where the hand plays, not while it waits
+        f["crossed"] += crossed
+        f["reg_left"] += max(0, nl.c - 64) / 12
+    if rh:
+        f["reg_right"] += max(0, 57 - nr.c) / 12
+    if lh and rh:  # both hands on neighbouring keys at once
+        f["touching"] += max(0, 3 - min(abs(a.pitch - b.pitch) for a in lh for b in rh))
+    played = [(n.pitch, "L") for n in lh] + [(n.pitch, "R") for n in rh]
+    single = None if lh and rh else "L" if lh else "R"
+    if last and t - last[0] < STREAM_DT:
+        # a fast line stays in one hand: each note continues the nearest note before it
+        for pitch, side in played:
+            p0, s0 = min(last[1], key=lambda x: abs(x[0] - pitch))
+            if s0 != side:
+                d = abs(p0 - pitch)
+                f["stream_step"] += d <= 2
+                f["stream_near"] += 2 < d <= 5
+        f["switch"] += single is not None and last[2] is not None and single != last[2]
+    return nl, nr, (t, played, single)
+
+
+def step_cost(f):
+    return sum(HAND_WEIGHTS.get(k, 0.0) * v for k, v in f.items())
+
+
+def hand_options(g):
+    """A chord splits into a lower and an upper block; the left hand takes the lower
+    one, or the upper one when the hands are crossed."""
+    options = set()
+    for k in range(len(g) + 1):
+        options.add((k, False))
+        if 0 < k < len(g):
+            options.add((k, True))
+    for k, crossed in sorted(options):
+        low, high = g[:k], g[k:]
+        yield (high, low) if crossed else (low, high)
+
+
+def assign_hands(groups):
+    """Beam search over chord groups for the cheapest way to play them with two hands.
+    The cost is a weighted sum of playing features (HAND_WEIGHTS, learned on scores
+    by bench/train_hands.py). Returns per group (left notes, right notes)."""
+    beam = [(0.0, HandState(48.0, None, []), HandState(67.0, None, []), None, None)]
+    history = []
+    for g in groups:
+        g = sorted(g, key=lambda n: n.pitch)
+        t = float(np.mean([n.start for n in g]))
+        nxt = {}
+        for bi, (cost0, L, R, _, last) in enumerate(beam):
+            for lh, rh in hand_options(g):
+                f = Terms()
+                nl, nr, played = hands_step(L, R, last, t, lh, rh, f)
+                cost = cost0 + step_cost(f)
+                key = (round(nl.c), round(nr.c), len(lh), played[2])
+                if key not in nxt or cost < nxt[key][0]:
+                    nxt[key] = (cost, nl, nr, (bi, lh, rh), played)
+        beam = sorted(nxt.values(), key=lambda s: s[0])[:BEAM]
+        history.append(beam)
+    out = []
+    i = 0
+    for step in range(len(history) - 1, -1, -1):
+        bi, lh, rh = history[step][i][3]
+        out.append((lh, rh))
+        i = bi
+    return out[::-1]
+
+
+def hand_features(groups, assignment):
+    """Summed features of a given assignment (for learning the weights)."""
+    f = Terms()
+    L, R, last = HandState(48.0, None, []), HandState(67.0, None, []), None
+    for g, (lh, rh) in zip(groups, assignment):
+        t = float(np.mean([n.start for n in g]))
+        L, R, last = hands_step(L, R, last, t, lh, rh, f)
+    return f
+
+
+def hand_events(notes, beat_of):
+    """Split chords between hands; per hand a time-ordered list of Events."""
+    hands = {"L": [], "R": []}
+    groups = group_onsets(notes)
+    for g, (lh, rh) in zip(groups, assign_hands(groups)):
+        for side, hn in (("L", lh), ("R", rh)):
+            if hn:
+                t0 = float(np.mean([n.start for n in hn]))
+                hands[side].append(Event(beat_of(t0), t0, list(hn), max(beat_of(n.end) for n in hn)))
+    return hands
+
+
+def quantize(notes, beat_of):
+    """Performance notes + beat mapping -> {"L"/"R": quantized Events}."""
+    hands = hand_events(notes, beat_of)
+    return {side: quantize_hand(evs) if evs else [] for side, evs in hands.items()}
+
+
 # ------------------------------------------------------------------ engraving
 
 def spelling_table(k):
@@ -435,20 +584,7 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         origin -= bar
     beat_of = lambda t: to_beat(t) - origin
 
-    # split chords between hands, build per-hand events
-    hands = {"L": [], "R": []}
-    centers = (50.0, 67.0)
-    for g in group_onsets(notes):
-        g = sorted(g, key=lambda n: n.pitch)
-        lh, rh, centers = split_hands([n.pitch for n in g], centers)
-        t0 = float(np.mean([n.start for n in g]))
-        for side, ps in (("L", lh), ("R", rh)):
-            hn = [n for n in g if n.pitch in ps]
-            if hn:
-                hands[side].append(Event(beat_of(t0), t0, hn, max(beat_of(n.end) for n in hn)))
-
-    for side in hands:
-        hands[side] = quantize_hand(hands[side]) if hands[side] else []
+    hands = quantize(notes, beat_of)
 
     last_end = max(max(e.q + max(Fraction(round(e.end_pos * 2), 2) - e.q, Fraction(1, e.sub)) for e in h)
                    for h in hands.values() if h)
@@ -608,7 +744,7 @@ def render_pdf(xml, pdf, title):
     tk.setOptions({"pageWidth": 2100, "pageHeight": 2970, "scale": 40, "adjustPageHeight": False,
                    "breaks": "auto", "footer": "none", "header": "none",
                    "pageMarginTop": 80, "pageMarginBottom": 80, "pageMarginLeft": 80, "pageMarginRight": 80})
-    tk.loadFile(str(xml))
+    tk.loadData(Path(xml).read_text(encoding="utf-8"))  # loadFile fails on non-ASCII paths
     pages = [tk.renderToSVG(i) for i in range(1, tk.getPageCount() + 1)]
     html = ["<!doctype html><meta charset='utf-8'><title>%s</title>" % title,
             "<style>@page{size:A4;margin:0}body{margin:0}div{page-break-after:always;width:210mm;height:297mm}"
