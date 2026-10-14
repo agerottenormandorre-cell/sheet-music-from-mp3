@@ -628,6 +628,36 @@ def render_pdf(xml, pdf, title):
 
 # ------------------------------------------------------------------ main
 
+STEPS = {"decode": "decoding", "notes": "transcribing notes", "beats": "tracking beats",
+         "score": "building score", "pdf": "rendering PDF"}
+
+
+def process(src, out_root, device, start=0, duration=0, rescore=False, marks=True, pdf=True, step=None):
+    """One recording -> out_root/<name>/. step(key) is called as each stage of STEPS begins."""
+    step = step or (lambda key: print(f"[{src.name}] {STEPS[key]}", flush=True))
+    out = Path(out_root) / src.stem
+    out.mkdir(parents=True, exist_ok=True)
+    wav, mid, act_file = out / "audio.wav", out / "performance.mid", out / "beats.npz"
+    if rescore and mid.exists() and act_file.exists():
+        data = np.load(act_file)
+        act, down = data["act"], data["down"]
+    else:
+        step("decode")
+        decode(src, wav, start, duration)
+        step("notes")
+        transcribe(wav, mid, device)
+        step("beats")
+        act, down = beat_activations(wav, device)
+        np.savez_compressed(act_file, act=act, down=down)
+        wav.unlink(missing_ok=True)
+    step("score")
+    info = build_score(mid, act, down, out / "score.musicxml", out / "score.mid", mark_uncertain=marks)
+    if pdf:
+        step("pdf")
+        info["pdf_pages"] = render_pdf(out / "score.musicxml", out / "score.pdf", src.stem)
+    return out, info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inputs", nargs="*", help="audio files (default: all in this folder)")
@@ -649,28 +679,9 @@ def main():
 
     failed = []
     for src in inputs:
-        out = Path(args.out) / src.stem
-        out.mkdir(parents=True, exist_ok=True)
-        wav, mid, act_file = out / "audio.wav", out / "performance.mid", out / "beats.npz"
         try:
-            if args.rescore and mid.exists() and act_file.exists():
-                data = np.load(act_file)
-                act, down = data["act"], data["down"]
-            else:
-                print(f"[{src.name}] decoding", flush=True)
-                decode(src, wav, args.start, args.duration)
-                print(f"[{src.name}] transcribing notes ({device})", flush=True)
-                transcribe(wav, mid, device)
-                print(f"[{src.name}] tracking beats", flush=True)
-                act, down = beat_activations(wav, device)
-                np.savez_compressed(act_file, act=act, down=down)
-                wav.unlink(missing_ok=True)
-            print(f"[{src.name}] building score", flush=True)
-            info = build_score(mid, act, down, out / "score.musicxml", out / "score.mid",
-                               mark_uncertain=not args.no_marks)
-            if not args.no_pdf:
-                pages = render_pdf(out / "score.musicxml", out / "score.pdf", src.stem)
-                info["pdf_pages"] = pages
+            out, info = process(src, args.out, device, args.start, args.duration, args.rescore,
+                                marks=not args.no_marks, pdf=not args.no_pdf)
             print(f"[{src.name}] done -> {out}  {info}", flush=True)
         except Exception as ex:  # keep going with the other files
             import traceback

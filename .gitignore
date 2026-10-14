@@ -3,3 +3,5 @@ __pycache__
 out/*
 badapple.mp3
 setup_log.txt
+*.exe
+gui_log.txt

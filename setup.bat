@@ -45,6 +45,10 @@ if errorlevel 1 (
     echo    готово
 )
 
+echo Собираю программу "Ноты из записи" ...
+"%PY%" build_app.py --shortcut >> "%LOG%" 2>&1
+if errorlevel 1 echo ОШИБКА при сборке программы, подробности в setup_log.txt
+
 echo.
-echo Установка завершена. Запускайте transcribe.bat
+echo Установка завершена. Запускайте "Ноты из записи" (ярлык на рабочем столе)
 pause
