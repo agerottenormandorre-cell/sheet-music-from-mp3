@@ -18,6 +18,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from beat_editor import BeatEditor
 from trim_editor import STEP, Analysis, MiniTrim, TrimEditor, clamp_marker, duration_text, fmt, parse_time
 
 ROOT = Path(__file__).resolve().parent
@@ -438,10 +439,19 @@ class Item(tk.Frame):
             text += f" · проверить на слух: {info['uncertain']}"
         self.status.config(text=text + self.bounds_text(), fg=OK)
         buttons = [(label, lambda n=name: self.open(n), name == "score.pdf")
-                   for label, name in (("Ноты PDF", "score.pdf"), ("Открыть в редакторе", "score.musicxml"),
+                   for label, name in (("Ноты PDF", "score.pdf"), ("Редактор", "score.musicxml"),
                                        ("Послушать", "performance.mid")) if (out / name).exists()]
         self.show_actions(buttons + [("Папка", lambda: open_path(out), False),
-                                     ("Границы…", self.edit, False)])
+                                     ("Доли…", self.edit_beats, False), ("Границы…", self.edit, False)])
+
+    def edit_beats(self):
+        if self.stage == "done" and (self.out / "beats.json").exists():
+            BeatEditor(self.app.root, self.src, self.out, self.opts["start"], self.rebuild, Button)
+
+    def rebuild(self):
+        """Score again from the cached recognition, with the edited beats."""
+        self.opts["rescore"] = True
+        self.app.enqueue(self)
 
     def open(self, name):
         if not open_path(self.out / name) and name == "score.musicxml":

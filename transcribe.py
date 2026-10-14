@@ -22,6 +22,7 @@ Output per recording, in out/<name>/:
 """
 
 import argparse
+import json
 import bisect
 import math
 import shutil
@@ -59,7 +60,7 @@ SYNC_WINDOW = 0.05     # s: onsets of both hands closer than this were played to
 # Quantization is a likelihood: onsets scatter around the grid with TIMING_SIGMA
 # (measured on real playing: ~0.05 beat), finer grids pay a prior penalty.
 TIMING_SIGMA = 0.078
-SUBDIVISIONS = [(1, 0.0), (2, 0.5), (4, 1.5), (3, 0.96), (8, 7.0), (6, 3.3), (5, 3.2), (7, 4.5)]
+SUBDIVISIONS = [(1, 0.0), (2, 0.5), (4, 1.5), (3, 0.96), (8, 7.0), (6, 3.3), (5, 5.0), (7, 6.0)]
 FAST_GRID = 1.013      # a grid of n >= 5 per beat only where the hand plays faster than FAST_GRID / n
 SWITCH_PENALTY = 0.72        # switching between duple (16ths) and triple (triplets) grids
 COLLISION_PENALTY = 6.25     # two onsets forced onto one grid slot (-> grace note)
@@ -73,6 +74,7 @@ VOICE_MIN = Fraction(1)      # ... if it lasts at least this long
 # mostly written as 4/4 (2/4 bars are too short to read at these tempi)
 METERS = {4: 0.0, 3: 0.3, 2: 1.5}
 METER_CHANGE = 6.0     # cost of a change of meter (log probability units)
+PEDAL_DENSE = 0.6      # pedal down this much of the piece (and changed about every bar): "con Ped."
 # MIDI velocity upper bounds for dynamics
 DYNAMICS = [(45, "pp"), (56, "p"), (66, "mp"), (78, "mf"), (90, "f"), (128, "ff")]
 
@@ -396,7 +398,7 @@ def quantize_hand(events):
         fastest = min(min(e.ioi for e in evs), getattr(evs[0], "ioi_in", math.inf))
         for si, (sub, penalty) in enumerate(SUBDIVISIONS):
             # grids of 5+ only for fast notes; odd tuplets only when the beat has (nearly) that many notes
-            if (sub >= 5 and fastest > FAST_GRID / sub) or (sub in (5, 7) and len(evs) < sub - 1):
+            if (sub >= 5 and fastest > FAST_GRID / sub) or (sub in (5, 7) and len(evs) < sub):
                 costs[b - b0, si] = np.inf
                 continue
             slots, cost = assign_slots(evs, fr, sub)
@@ -651,20 +653,21 @@ def align_hands(hands):
     return moved
 
 
-def quantize(notes, grid, origin, hand_notes=None):
+def quantize(notes, grid, origin, hand_notes=None, rounds=None):
     """Performance notes + beat times -> ({"L"/"R": quantized Events}, refined beat times).
 
     grid[i] is the time of beat i; score position 0 is beat `origin`. Hands are
     assigned once; quantization and beat refitting then alternate REFIT_ROUNDS times."""
     if hand_notes is None:
         hand_notes = assign_hands(group_onsets(notes))
-    for rnd in range(REFIT_ROUNDS + 1):
+    rounds = REFIT_ROUNDS if rounds is None else rounds
+    for rnd in range(rounds + 1):
         idx = np.arange(len(grid), dtype=float)
         beat_of = lambda t, g=grid: float(np.interp(t, g, idx)) - origin
         hands = {side: quantize_hand(evs) if evs else []
                  for side, evs in hand_events(hand_notes, beat_of).items()}
         align_hands(hands)
-        if rnd < REFIT_ROUNDS:
+        if rnd < rounds:
             grid = refit_beats(hands, grid, origin)
     return hands, grid
 
@@ -823,7 +826,12 @@ def make_element(pitches, names, ql=None, grace_type=None):
     return el
 
 
-def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
+def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True, beat_file=None):
+    """Performance MIDI + beat activations -> MusicXML and quantized MIDI.
+
+    With `beat_file` (beats edited by hand: {"beats": [s], "bars": [index of each bar's
+    first beat]}) those beats and bar lines are used as they are. The beats and bar
+    lines used are written to beats.json next to out_xml, for the beat editor."""
     from music21 import clef, dynamics, expressions, key, layout, meter, stream, tempo
     from music21 import note as m21note
 
@@ -834,8 +842,19 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         raise RuntimeError("no notes transcribed")
     t_end = max(n.end for n in notes)
 
-    beats, T = dp_beats(act)
-    first_down, lengths = track_bars(beats, down)
+    if beat_file:
+        edited = json.loads(Path(beat_file).read_text(encoding="utf-8"))
+        beats = np.array(edited["beats"], dtype=float)
+        firsts = sorted(set(int(i) for i in edited["bars"] if 0 <= int(i) < len(beats))) or [0]
+        lengths = [b - a for a, b in zip(firsts, firsts[1:])]
+        lengths = lengths + [lengths[-1] if lengths else 4]
+        first_down = firsts[0]
+        T = float(np.median(np.diff(beats)))
+        refit = 0  # the player's own beats stay where they were put
+    else:
+        beats, T = dp_beats(act)
+        first_down, lengths = track_bars(beats, down)
+        refit = None
     grid, n_pre = extend_beats(beats, t_end)
     idx = np.arange(len(grid), dtype=float)
     to_beat = lambda t: float(np.interp(t, grid, idx))
@@ -851,7 +870,7 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
     bars = Bars(lengths)
     beat_of = lambda t: to_beat(t) - origin
 
-    hands, grid = quantize(notes, grid, origin)
+    hands, grid = quantize(notes, grid, origin, rounds=refit)
     to_beat = lambda t: float(np.interp(t, grid, idx))
     beat_of = lambda t: to_beat(t) - origin
 
@@ -959,22 +978,32 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
             level = new
             rh.insert(bars.starts[b], dynamics.Dynamic(DYNAMICS[new][1]))
 
-    # sustain pedal: Ped. ... * spanning the left-hand notes it holds
+    # sustain pedal: where it is down most of the time and changes about every bar, one
+    # "con Ped." as in romantic editions; otherwise Ped. ... * over the notes it holds
     downs = sorted((c.time, c.value) for c in inst.control_changes if c.number == 64)
-    pedal_on = None
+    presses, pedal_on = [], None
     for t, v in downs:
         if v >= 64 and pedal_on is None:
             pedal_on = t
         elif v < 64 and pedal_on is not None:
             a, b = beat_of(pedal_on) - 0.1, beat_of(t)
-            held = [e.element for e in hands["L"] if a <= float(e.q) < b] or \
-                   [e.element for e in hands["R"] if a <= float(e.q) < b]
-            if held and b - a >= 0.6:  # shorter presses are flutter, not pedaling
+            if b - a >= 0.6:  # shorter presses are flutter, not pedaling
+                presses.append((a, b))
+            pedal_on = None
+    covered = sum(b - a for a, b in presses)
+    if presses and covered > PEDAL_DENSE * float(total) and len(presses) >= 0.75 * n_bars:
+        con = expressions.TextExpression("con Ped.")
+        con.placement = "below"
+        con.style.fontStyle = "italic"
+        lh.insert(0, con)
+    else:
+        for a, b in presses:
+            held = [e.element for e in hands["L"] if a <= float(e.q) < b] or                    [e.element for e in hands["R"] if a <= float(e.q) < b]
+            if held:
                 pm_ = expressions.PedalMark(*held)
                 pm_.pedalType = expressions.PedalType.Sustain
                 pm_.pedalForm = expressions.PedalForm.Symbol
                 (lh if held[0] in lh else rh).insert(0, pm_)
-            pedal_on = None
 
     score.insert(0, rh)
     score.insert(0, lh)
@@ -997,6 +1026,14 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
                         r.style.hideObjectOnPrint = True
     score.write("musicxml", fp=str(out_xml))
     score.write("midi", fp=str(out_mid))
+    # the beats as used, from the first bar line to the end of the score
+    last = min(len(grid) - 1, int(math.ceil(origin + float(bars.end))))
+    first_beat = max(0, int(math.floor(origin)))
+    used = [float(t) for t in grid[first_beat:last + 1]]
+    bar_firsts = [int(round(origin + float(b0))) - first_beat for b0 in bars.starts]
+    (Path(out_xml).parent / "beats.json").write_text(
+        json.dumps({"beats": [round(t, 4) for t in used], "bars": [i for i in bar_firsts if 0 <= i < len(used)]}),
+        encoding="utf-8")
     ibi = np.diff(beats)
     return dict(notes=len(notes), bpm=round(60 / T), tempo_range=f"{60 / ibi.max():.0f}-{60 / ibi.min():.0f}",
                 meter=bars.signature(), key=str(k), bars=n_bars, uncertain=n_uncertain)
@@ -1063,8 +1100,11 @@ def process(src, out_root, device, start=0, duration=0, rescore=False, marks=Tru
         act, down = beat_activations(wav, device)
         np.savez_compressed(act_file, act=act, down=down)
         wav.unlink(missing_ok=True)
+        (out / "beats_edit.json").unlink(missing_ok=True)  # edited beats belong to the old recognition
     step("score")
-    info = build_score(mid, act, down, out / "score.musicxml", out / "score.mid", mark_uncertain=marks)
+    edited = out / "beats_edit.json"
+    info = build_score(mid, act, down, out / "score.musicxml", out / "score.mid", mark_uncertain=marks,
+                       beat_file=edited if edited.exists() else None)
     if pdf:
         step("pdf")
         info["pdf_pages"] = render_pdf(out / "score.musicxml", out / "score.pdf", src.stem)
