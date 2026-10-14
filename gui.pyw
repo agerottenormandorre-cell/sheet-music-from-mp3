@@ -18,6 +18,8 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from trim_editor import TrimEditor, fmt
+
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out"
 LOG_FILE = ROOT / "gui_log.txt"
@@ -28,6 +30,7 @@ AUTHOR_EMAIL = "astramixofficial@gmail.com"
 
 # stage -> (share of the progress bar where it starts, where it ends, typical seconds, label)
 STAGES = {
+    "trim":   (0.00, 0.00, 1, "ждёт выбора границ"),
     "queued": (0.00, 0.00, 1, "в очереди"),
     "decode": (0.00, 0.05, 1, "читаю запись"),
     "notes":  (0.05, 0.65, 8, "распознаю ноты"),
@@ -159,9 +162,10 @@ class Worker(threading.Thread):
             self.events.put(("broken", "Не удалось загрузить библиотеки — запустите setup.bat"))
             return
         while True:
-            item, opts = self.jobs.get()
-            if item.stage == "removed":
+            item, ticket = self.jobs.get()
+            if item.stage != "queued" or item.ticket != ticket:  # removed, or re-queued with new bounds
                 continue
+            opts = item.opts  # read now: bounds may change while queued
             try:
                 out, info = self.engine.process(
                     item.src, OUT, self.device, opts["start"], opts["duration"], opts["rescore"],
@@ -235,11 +239,12 @@ class DropZone(tk.Canvas):
 
 
 class Item(tk.Frame):
-    """One recording in the list."""
+    """One recording in the list. opts are its own processing options, bounds included."""
 
-    def __init__(self, parent, app, src):
+    def __init__(self, parent, app, src, opts):
         super().__init__(parent, bg=CARD, highlightbackground=LINE, highlightthickness=1)
-        self.app, self.src, self.stage, self.since, self.out = app, src, "queued", time.time(), None
+        self.app, self.src, self.opts, self.out = app, src, opts, None
+        self.stage, self.since, self.ticket = "new", time.time(), 0
         self.columnconfigure(0, weight=1)
         top = tk.Frame(self, bg=CARD)
         top.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
@@ -247,14 +252,36 @@ class Item(tk.Frame):
         tk.Label(top, text="♪", bg=CARD, fg=ACCENT, font=(FONT, 14)).grid(row=0, column=0, rowspan=2, padx=(0, 10))
         tk.Label(top, text=src.name, bg=CARD, fg=INK, font=(FONT, 11, "bold"), anchor="w").grid(
             row=0, column=1, sticky="ew")
-        self.status = tk.Label(top, text="в очереди", bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w")
+        self.status = tk.Label(top, text="", bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w")
         self.status.grid(row=1, column=1, columnspan=2, sticky="ew")
         self.actions = tk.Frame(top, bg=CARD)
         self.actions.grid(row=0, column=2, sticky="e")
-        self.remove = Button(self.actions, "✕", self.drop, small=True)
-        self.remove.pack(side="right")
         self.bar = ttk.Progressbar(self, style="Notes.Horizontal.TProgressbar", maximum=1.0)
         self.bar.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+
+    def show_actions(self, buttons):
+        for w in self.actions.winfo_children():
+            w.destroy()
+        for label, cmd, primary in buttons:
+            Button(self.actions, label, cmd, small=True, primary=primary).pack(side="left", padx=(6, 0))
+
+    def bounds_text(self):
+        start, duration = self.opts["start"], self.opts["duration"]
+        if not start and not duration:
+            return ""
+        return f" · фрагмент {fmt(start)}–{fmt(start + duration) if duration else 'конец'}"
+
+    def wait_trim(self):
+        self.stage = "trim"
+        self.status.config(text=STAGES["trim"][3] + self.bounds_text(), fg=MUTED)
+        self.show_actions([("✕", self.drop, False)])
+
+    def queue(self):
+        self.stage, self.out = "queued", None
+        self.bar["value"] = 0
+        self.bar.grid()
+        self.status.config(text="в очереди" + self.bounds_text(), fg=MUTED)
+        self.show_actions([("Границы…", lambda: self.app.edit(self), False), ("✕", self.drop, False)])
 
     def drop(self):
         self.app.remove(self)
@@ -262,41 +289,40 @@ class Item(tk.Frame):
     def set_stage(self, key):
         self.stage, self.since = key, time.time()
         self.status.config(text=STAGES[key][3] + "…", fg=ACCENT)
-        if self.remove.winfo_exists():
-            self.remove.destroy()
+        self.show_actions([])
 
     def tick(self):
         """Within a stage the bar creeps towards the stage's end so the window never looks stuck."""
-        if self.stage not in STAGES or self.stage == "queued":
+        if self.stage not in STAGES or self.stage in ("queued", "trim"):
             return
         a, b, tau, _ = STAGES[self.stage]
         self.bar["value"] = a + (b - a) * 0.95 * (1 - math.exp(-(time.time() - self.since) / tau))
 
     def finish(self, out, info):
-        self.stage, self.out = "done", out
+        self.stage, self.out, self.info = "done", out, info
         self.bar.grid_remove()
         text = f"готово · тактов: {info.get('bars')} · {info.get('meter')} · ♩≈{info.get('bpm')}"
         if info.get("key"):
             text += " · " + key_name(info["key"])
         if info.get("uncertain"):
             text += f" · проверить на слух: {info['uncertain']}"
-        self.status.config(text=text, fg=OK)
-        for label, name in (("Ноты PDF", "score.pdf"), ("Открыть в редакторе", "score.musicxml"),
-                            ("Послушать", "performance.mid")):
-            if (out / name).exists():
-                Button(self.actions, label, lambda n=name: self.open(n), small=True,
-                       primary=name == "score.pdf").pack(side="left", padx=(6, 0))
-        Button(self.actions, "Папка", lambda: open_path(out), small=True).pack(side="left", padx=(6, 0))
+        self.status.config(text=text + self.bounds_text(), fg=OK)
+        buttons = [(label, lambda n=name: self.open(n), name == "score.pdf")
+                   for label, name in (("Ноты PDF", "score.pdf"), ("Открыть в редакторе", "score.musicxml"),
+                                       ("Послушать", "performance.mid")) if (out / name).exists()]
+        self.show_actions(buttons + [("Папка", lambda: open_path(out), False),
+                                     ("Границы…", lambda: self.app.edit(self), False)])
 
     def open(self, name):
         if not open_path(self.out / name) and name == "score.musicxml":
             self.app.toast("Нет программы для MusicXML. Установите MuseScore 4 (musescore.org, бесплатно).")
 
     def fail(self, msg):
-        self.stage = "failed"
+        self.stage, self.error = "failed", msg
         self.bar["value"] = 0
         self.status.config(text="ошибка: " + msg[:120], fg=ERR)
-        Button(self.actions, "Журнал", self.app.show_log, small=True).pack(side="left", padx=(6, 0))
+        self.show_actions([("Журнал", self.app.show_log, False), ("Границы…", lambda: self.app.edit(self), False),
+                           ("✕", self.drop, False)])
 
 
 # ------------------------------------------------------------------ app
@@ -304,6 +330,7 @@ class Item(tk.Frame):
 class App:
     def __init__(self, root, initial):
         self.root, self.items, self.events = root, [], queue.Queue()
+        self.pending, self.editor = [], None  # recordings waiting for their bounds; the open editor
         self.dropped = queue.Queue()
         sys.stdout = sys.stderr = Log(self.events)
         self.worker = Worker(self.events)
@@ -351,18 +378,15 @@ class App:
         opts = tk.Frame(root, bg=BG)
         opts.pack(fill="x", padx=24, pady=(10, 4))
         self.marks, self.pdf, self.rescore = tk.BooleanVar(value=True), tk.BooleanVar(value=True), tk.BooleanVar()
-        for text, var in (("Подсвечивать сомнительные ноты", self.marks), ("Делать PDF", self.pdf),
-                          ("Не распознавать заново, только пересобрать ноты", self.rescore)):
-            tk.Checkbutton(opts, text=text, variable=var, bg=BG, fg=INK, activebackground=BG,
+        self.trim = tk.BooleanVar(value=True)
+        opts2 = tk.Frame(root, bg=BG)
+        opts2.pack(fill="x", padx=24)
+        for frame, text, var in ((opts, "Выбирать начало и конец по спектру перед распознаванием", self.trim),
+                                 (opts, "Подсвечивать сомнительные ноты", self.marks),
+                                 (opts2, "Делать PDF", self.pdf),
+                                 (opts2, "Не распознавать заново, только пересобрать ноты", self.rescore)):
+            tk.Checkbutton(frame, text=text, variable=var, bg=BG, fg=INK, activebackground=BG,
                            selectcolor=CARD, font=(FONT, 9), cursor="hand2").pack(side="left", padx=(0, 14))
-        frag = tk.Frame(root, bg=BG)
-        frag.pack(fill="x", padx=24)
-        tk.Label(frag, text="Только фрагмент: с", bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
-        self.start, self.length = tk.StringVar(value="0"), tk.StringVar(value="")
-        for var, label in ((self.start, "сек, длиной"), (self.length, "сек (пусто — до конца)")):
-            tk.Entry(frag, textvariable=var, width=5, font=(FONT, 9), relief="flat", bg=CARD,
-                     highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT).pack(side="left", padx=4)
-            tk.Label(frag, text=label, bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
 
         credits = tk.Frame(root, bg=BG)
         credits.pack(side="bottom", fill="x", padx=24, pady=(0, 12))
@@ -415,13 +439,7 @@ class App:
             self.add([folder])
 
     def options(self):
-        def num(var):
-            try:
-                return max(0.0, float(var.get().replace(",", ".") or 0))
-            except ValueError:
-                return 0.0
-        return dict(start=num(self.start), duration=num(self.length), marks=self.marks.get(),
-                    pdf=self.pdf.get(), rescore=self.rescore.get())
+        return dict(start=0.0, duration=0.0, marks=self.marks.get(), pdf=self.pdf.get(), rescore=self.rescore.get())
 
     def add(self, paths):
         files = collect_audio(paths)
@@ -431,17 +449,72 @@ class App:
         if files:
             self.empty.pack_forget()
             self.zone.flash()
-        opts = self.options()
         for src in files:
-            item = Item(self.list, self, src)
+            item = Item(self.list, self, src, self.options())
             item.pack(fill="x", pady=(0, 8))
             self.items.append(item)
-            self.worker.jobs.put((item, opts))
+            if self.trim.get():
+                item.wait_trim()
+                self.pending.append(item)
+            else:
+                self.enqueue(item)
+        self.next_editor()
         self.update_state()
 
+    def enqueue(self, item):
+        item.queue()
+        item.ticket += 1
+        self.worker.jobs.put((item, item.ticket))
+
+    def edit(self, item):
+        """New bounds for a queued, finished or failed recording."""
+        if item.stage in ("queued", "done", "failed"):
+            item.previous = item.stage
+            item.wait_trim()
+            self.pending.insert(0, item)
+            self.next_editor()
+
+    def next_editor(self):
+        """One editor at a time; the next recording waiting for bounds opens when it closes."""
+        if self.editor and self.editor.winfo_exists():
+            self.editor.lift()
+            return
+        self.editor = None
+        while self.pending:
+            item = self.pending.pop(0)
+            if item.stage == "trim" and item.winfo_exists():
+                break
+        else:
+            return
+        o = item.opts
+        bounds = (o["start"], o["start"] + o["duration"] if o["duration"] else 0) if o["start"] or o["duration"] else None
+        self.editor = TrimEditor(self.root, item.src, lambda s, d: self.trimmed(item, s, d),
+                                 lambda: self.trim_skipped(item), Button, bounds)
+
+    def trimmed(self, item, start, duration):
+        if item.winfo_exists():
+            item.opts.update(start=start, duration=duration, rescore=False)  # new bounds need new recognition
+            self.enqueue(item)
+            self.update_state()
+        self.root.after(1, self.next_editor)
+
+    def trim_skipped(self, item):
+        """A new recording is dropped from the list; an edited one keeps its previous state."""
+        if item.winfo_exists():
+            previous = getattr(item, "previous", None)
+            if previous == "queued":
+                item.queue()  # its ticket is still in the worker's queue
+            elif previous == "done":
+                item.finish(item.out, item.info)
+            elif previous == "failed":
+                item.fail(item.error)
+            else:
+                self.remove(item)
+            item.previous = None
+        self.root.after(1, self.next_editor)
+
     def remove(self, item):
-        if item.stage == "queued":
-            item.stage = "removed"
+        item.stage = "removed"
         item.destroy()
         self.items.remove(item)
         if not self.items:
