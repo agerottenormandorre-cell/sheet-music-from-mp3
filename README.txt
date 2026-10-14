@@ -84,7 +84,7 @@
 --------------------------------
   .venv\Scripts\python transcribe.py запись.mp3 --start 30 --duration 20   фрагмент
   .venv\Scripts\python transcribe.py запись.mp3 --rescore                  пересобрать ноты без повторного распознавания
-  .venv\Scripts\python benchench.py                                     проверка качества на нотах с известным ответом
+  .venv\Scripts\python bench\bench.py                                     проверка качества на нотах с известным ответом
 
 Если окружение сломалось или переносите на другой компьютер, запустите setup.bat.
 Если пропала программа или ярлык: .venv\Scripts\python build_app.py --shortcut
