@@ -117,7 +117,8 @@ if ($haveTorch) {
         Say "   найдена видеокарта NVIDIA: качаю PyTorch для видеокарты (около 3 ГБ, это надолго) ..."
     } else {
         $build = "cpu"
-        Say "   видеокарты NVIDIA нет: качаю PyTorch для процессора (около 250 МБ) ..."
+        if ($Cpu) { Say "   качаю PyTorch для процессора (около 250 МБ) ..." }
+        else { Say "   видеокарты NVIDIA нет: качаю PyTorch для процессора (около 250 МБ) ..." }
     }
     Retry "PyTorch" $Py @("-m", "pip", "install", "--timeout", "120", "--retries", "10",
                           "torch==$TorchVersion", "torchaudio", "--index-url", "$TorchIndex/$build")
@@ -142,8 +143,15 @@ Retry "transkun" $Py @("-m", "pip", "install", "--timeout", "120", "--retries", 
 
 Say "[4/5] Модель для определения долей"
 Retry "модель долей" $Py @("-c", "from beat_this.inference import Audio2Frames; Audio2Frames(checkpoint_path='final0', device='cpu'); print('beat model OK')")
-$check = & $Py -c "import sys; sys.path.insert(0, r'$Root'); import transcribe, torch; print('cuda' if torch.cuda.is_available() else 'cpu')" 2>$null
-if (-not $check) { Fail "программа не запускается в новом окружении" }
+# load both networks for real: a missing module only shows up then
+$probe = "import sys; sys.path.insert(0, r'$Root'); import torch, transcribe, trim_editor, beat_editor; " +
+         "transcribe.load_transkun('cpu'); from beat_this.inference import Audio2Frames; " +
+         "Audio2Frames(checkpoint_path='final0', device='cpu'); print('cuda' if torch.cuda.is_available() else 'cpu')"
+$check = & $Py -c $probe 2>$null | Select-Object -Last 1
+if ($check -ne "cuda" -and $check -ne "cpu") {
+    Run $Py @("-c", $probe) | Out-Null   # the error goes to the log
+    Fail "программа не запускается в новом окружении"
+}
 if ($check -eq "cuda") { Say "   распознавание будет идти на видеокарте" }
 else { Say "   распознавание будет идти на процессоре (медленнее: трёхминутная запись - несколько минут)" }
 

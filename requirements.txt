@@ -13,3 +13,4 @@ einops==0.8.2
 rotary-embedding-torch==0.9.1
 verovio==6.3.0
 pillow==12.2.0
+mir_eval==0.8.2       # imported by transkun
