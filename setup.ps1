@@ -16,6 +16,8 @@ param([switch]$Cpu, [switch]$Fresh, [switch]$NoShortcut)
 $ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is very slow with the progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$env:PYTHONIOENCODING = "utf-8"           # file names in the log stay readable ...
+[Console]::OutputEncoding = [Text.Encoding]::UTF8   # ... and are read back as UTF-8
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Log = Join-Path $Root "setup_log.txt"
@@ -41,7 +43,10 @@ function Fail([string]$text) {
 
 # runs a program, its output goes to the log; returns the exit code
 function Run([string]$exe, [string[]]$arguments) {
-    & $exe @arguments 2>&1 | ForEach-Object { "$_" } | Out-File $Log -Append -Encoding utf8
+    & $exe @arguments 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+    } | Where-Object { $_ -and $_ -ne "System.Management.Automation.RemoteException" } |
+        Out-File $Log -Append -Encoding utf8
     return $LASTEXITCODE
 }
 
