@@ -12,7 +12,7 @@ Numbers (fraction of notes):
     hand    written in the right hand / staff
     onset   at exactly the right position in the bar
     grace   turned into a grace note (the score has none)
-    voice   melody notes held for their written length (once voices exist)
+    length  written with exactly the score's note value (right hand and onset needed)
 """
 
 import math
@@ -172,7 +172,10 @@ def run(name, seed, verbose=False, hard=False):
     drift = drift / (drift.std() + 1e-9) * TRACK_DRIFT
     tracked = beat_times + drift + rng.normal(0, TRACK_JITTER, len(beat_times))
     grid, n_pre = tr.extend_beats(tracked, max(n.end for n in notes))
-    hands, _ = tr.quantize(notes, grid, n_pre)
+    hands, grid = tr.quantize(notes, grid, n_pre)
+    idx = np.arange(len(grid), dtype=float)
+    chunks, _ = tr.arrange(hands, lambda t: float(np.interp(t, grid, idx)) - n_pre, 4)
+    written = {id(n): c.dur for cs in chunks.values() for c in cs for n in c.notes}
 
     placed = {}
     for side, events in hands.items():
@@ -180,7 +183,7 @@ def run(name, seed, verbose=False, hard=False):
             for n in e.notes:
                 placed[id(n)] = (side, e.q, e)
     n = len(notes)
-    hand_ok = onset_ok = grace = 0
+    hand_ok = onset_ok = grace = dur_ok = 0
     errors = []
     for note_ in notes:
         t = truth_of[id(note_)]
@@ -195,9 +198,13 @@ def run(name, seed, verbose=False, hard=False):
             errors.append(f"  hand   q={t.q} pitch={t.pitch} {t.hand}->{side}")
         if q != t.q:
             errors.append(f"  onset  q={t.q} -> {q} pitch={t.pitch} {t.hand}")
+        elif side == t.hand:
+            dur_ok += written[id(note_)] == t.dur
+            if written[id(note_)] != t.dur:
+                errors.append(f"  dur    q={t.q} pitch={t.pitch} {t.hand} {t.dur} -> {written[id(note_)]}")
     if verbose:
         print("\n".join(sorted(errors, key=lambda s: Fraction(s.split("q=")[1].split()[0]))[:40]))
-    return dict(hand=hand_ok / n, onset=onset_ok / n, grace=grace / n, notes=n)
+    return dict(hand=hand_ok / n, onset=onset_ok / n, grace=grace / n, dur=dur_ok / n, notes=n)
 
 
 def main():
@@ -206,15 +213,15 @@ def main():
     names = args or list(PIECES)
     seeds = [1] if verbose else [1, 2, 3]
     rows = []
-    print(f"{'piece':10} {'notes':>6} {'hand':>7} {'onset':>7} {'grace':>7}")
+    print(f"{'piece':10} {'notes':>6} {'hand':>7} {'onset':>7} {'grace':>7} {'length':>7}")
     for name in names:
         rs = [run(name, s, verbose, "--hard" in sys.argv) for s in seeds]
         r = {k: float(np.mean([x[k] for x in rs])) for k in rs[0]}
         rows.append(r)
-        print(f"{name:10} {r['notes']:6.0f} {r['hand']:7.1%} {r['onset']:7.1%} {r['grace']:7.1%}")
+        print(f"{name:10} {r['notes']:6.0f} {r['hand']:7.1%} {r['onset']:7.1%} {r['grace']:7.1%} {r['dur']:7.1%}")
     if len(rows) > 1:
-        m = {k: float(np.mean([r[k] for r in rows])) for k in ("hand", "onset", "grace")}
-        print(f"{'MEAN':10} {'':6} {m['hand']:7.1%} {m['onset']:7.1%} {m['grace']:7.1%}")
+        m = {k: float(np.mean([r[k] for r in rows])) for k in ("hand", "onset", "grace", "dur")}
+        print(f"{'MEAN':10} {'':6} {m['hand']:7.1%} {m['onset']:7.1%} {m['grace']:7.1%} {m['dur']:7.1%}")
 
 
 if __name__ == "__main__":

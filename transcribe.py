@@ -66,6 +66,8 @@ ROLL_SIGMA = 0.044           # s: typical spread of a rolled chord / melody play
 UNCERTAIN = 0.09             # beats off the grid: such notes are colored for checking by ear
 UNCERTAIN_COLOR = "#C2185B"
 LEGATO_GAP = Fraction(1, 2)  # rests shorter than this (in beats) are absorbed into the note
+VOICE_HOLD = Fraction(1, 2)  # a key held this long (beats) after the hand's next onset is a voice ...
+VOICE_MIN = Fraction(1)      # ... if it lasts at least this long
 # MIDI velocity upper bounds for dynamics
 DYNAMICS = [(45, "pp"), (56, "p"), (66, "mp"), (78, "mf"), (90, "f"), (128, "ff")]
 
@@ -264,7 +266,7 @@ class Event:
         self.q = None             # quantized position (Fraction)
         self.sub = 2              # grid of its beat
         self.graces = []          # list of pitch lists, played just before
-        self.dur = None
+        self.element = None       # its first written note or chord
 
 
 def merge_cost(main, other):
@@ -595,6 +597,106 @@ def quantize(notes, grid, origin, hand_notes=None):
     return hands, grid
 
 
+# ------------------------------------------------------------------ voices and note values
+
+class Chunk:
+    """The part of one Event written in one voice of its staff."""
+
+    def __init__(self, event, voice, notes, end_pos, held=None):
+        self.event, self.voice, self.notes = event, voice, notes
+        self.q = event.q
+        self.end_pos = end_pos   # release of its notes, in beats
+        self.held = held         # for a held note: its written end
+        self.dur = None
+        self.element = None
+
+
+def split_voices(events, beat_of):
+    """One hand's events -> Chunks in voice 1 (stems up) or 2 (stems down).
+
+    A note the finger holds while the same hand plays on is a voice of its own:
+    held on top it is a melody (voice 1) over the moving notes (voice 2), held at
+    the bottom a bass (voice 2) under them. Without held notes everything is voice 1."""
+    chunks = []
+    busy = {1: Fraction(-1), 2: Fraction(-1)}  # until when a held note occupies the voice
+    for i, e in enumerate(events):
+        later = [x.q for x in events[i + 1:]]
+        ends = {id(n): beat_of(n.end) for n in e.notes}
+        first_next = e.q + Fraction(1, e.sub)
+
+        def held_to(n):
+            end = Fraction(round(ends[id(n)] * 2), 2)
+            for q2 in later:
+                if q2 >= end:
+                    break
+                if q2 >= first_next and end - q2 >= VOICE_HOLD and end - e.q >= VOICE_MIN:
+                    return end
+            return None
+
+        held = {id(n): held_to(n) for n in e.notes}
+        S = [n for n in e.notes if held[id(n)] is not None]
+        M = [n for n in e.notes if held[id(n)] is None]
+        if S and M and not (min(n.pitch for n in S) > max(n.pitch for n in M)
+                            or max(n.pitch for n in S) < min(n.pitch for n in M)):
+            S, M = [], list(e.notes)  # held notes in the middle of a chord: keep the chord
+        if S:
+            until = max(held[id(n)] for n in S)
+            if M:
+                upper = min(n.pitch for n in S) > max(n.pitch for n in M)
+            else:  # a single held note: above or below what the hand plays meanwhile?
+                during = [n.pitch for x in events[i + 1:] if x.q < until for n in x.notes]
+                upper = not during or np.median(during) < np.mean([n.pitch for n in S])
+            sv, mv = (1, 2) if upper else (2, 1)
+            chunks.append(Chunk(e, sv, S, max(ends[id(n)] for n in S), until))
+            busy[sv] = until
+            if M:
+                chunks.append(Chunk(e, mv, M, max(ends[id(n)] for n in M)))
+        else:
+            free = [v for v in (1, 2) if busy[v] <= e.q]
+            v = 1 if len(free) != 1 else free[0]
+            if not free:
+                v = min((1, 2), key=lambda x: busy[x])
+            chunks.append(Chunk(e, v, list(e.notes), max(ends.values())))
+    return chunks
+
+
+def note_values(chunks, total):
+    """Written length of every chunk. Within its voice a note runs on to the next
+    onset unless a real rest (LEGATO_GAP or longer) follows; then its release is
+    rounded to the half beat. A held note keeps its held length."""
+    for v in (1, 2):
+        cs = sorted((c for c in chunks if c.voice == v), key=lambda c: c.q)
+        for i, c in enumerate(cs):
+            nxt = cs[i + 1].q if i + 1 < len(cs) else total
+            sub = c.event.sub
+            if c.held is not None:
+                end = max(c.held, c.q + Fraction(1, sub))
+            else:
+                end = Fraction(round(c.end_pos * sub), sub)
+            if nxt - end < LEGATO_GAP:
+                end = nxt
+            elif c.held is None:
+                end = min(max(Fraction(math.ceil(c.end_pos * 2), 2), c.q + Fraction(1, sub)), nxt)
+            else:
+                end = min(end, nxt)
+            # a value running from a triplet into a duple beat (or back) would need a
+            # 12-tuplet: end it at the beat line and let a rest take the remainder
+            if (c.q.denominator % 3 == 0) != (end.denominator % 3 == 0) and math.floor(end) > c.q:
+                end = Fraction(math.floor(end))
+            c.dur = end - c.q
+
+
+def arrange(hands, beat_of, bar):
+    """Quantized events of both hands -> ({"L"/"R": Chunks with note values}, total length)."""
+    chunks = {side: split_voices(evs, beat_of) for side, evs in hands.items()}
+    last_end = max((c.q + max(Fraction(round(c.end_pos * 2), 2) - c.q, Fraction(1, c.event.sub))
+                    for cs in chunks.values() for c in cs), default=Fraction(bar))
+    total = Fraction(max(1, math.ceil(last_end / bar)) * bar)
+    for cs in chunks.values():
+        note_values(cs, total)
+    return chunks, total
+
+
 # ------------------------------------------------------------------ engraving
 
 def spelling_table(k):
@@ -673,25 +775,7 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
     to_beat = lambda t: float(np.interp(t, grid, idx))
     beat_of = lambda t: to_beat(t) - origin
 
-    last_end = max(max(e.q + max(Fraction(round(e.end_pos * 2), 2) - e.q, Fraction(1, e.sub)) for e in h)
-                   for h in hands.values() if h)
-    total = Fraction(max(1, math.ceil(last_end / bar)) * bar)
-
-    # Piano writing: a note runs on to the hand's next onset unless a real rest
-    # (an eighth or longer) follows; then its release is rounded to the half beat.
-    for events in hands.values():
-        for i, e in enumerate(events):
-            nxt = events[i + 1].q if i + 1 < len(events) else total
-            end = Fraction(round(e.end_pos * e.sub), e.sub)
-            if nxt - end < LEGATO_GAP:
-                end = nxt
-            else:
-                end = min(max(Fraction(math.ceil(e.end_pos * 2), 2), e.q + Fraction(1, e.sub)), nxt)
-            # a value running from a triplet into a duple beat (or back) would need a
-            # 12-tuplet: end it at the beat line and let a rest take the remainder
-            if (e.q.denominator % 3 == 0) != (end.denominator % 3 == 0) and math.floor(end) > e.q:
-                end = Fraction(math.floor(end))
-            e.dur = end - e.q
+    chunks, total = arrange(hands, beat_of, bar)
 
     # key from the performance itself, then spell every pitch in it
     probe = stream.Stream()
@@ -708,25 +792,34 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         part.append(clef.TrebleClef() if side == "R" else clef.BassClef())
         part.append(key.KeySignature(k.sharps))
         part.append(meter.TimeSignature(f"{bar}/4"))
-        cursor = Fraction(0)
-        for e in hands[side]:
-            if e.q > cursor:
-                part.append(m21note.Rest(quarterLength=e.q - cursor))
-            gtype = "16th" if len(e.graces) > 1 else "eighth"
-            for gp in e.graces:
-                g = make_element(gp, names, grace_type=gtype)
-                if mark_uncertain:
-                    g.style.color = UNCERTAIN_COLOR
-                part.append(g)
-            el = make_element([n.pitch for n in e.notes], names, ql=e.dur)
-            if mark_uncertain and abs(e.pos - float(e.q)) > UNCERTAIN:
-                el.style.color = UNCERTAIN_COLOR
-                n_uncertain += 1
-            e.element = el
-            part.append(el)
-            cursor = e.q + e.dur
-        if total > cursor:
-            part.append(m21note.Rest(quarterLength=total - cursor))
+        used = sorted({c.voice for c in chunks[side]}) or [1]
+        for v in used:
+            line = stream.Voice(id=v) if len(used) > 1 else part
+            cursor = Fraction(0)
+            for c in sorted((c for c in chunks[side] if c.voice == v), key=lambda c: c.q):
+                e = c.event
+                if c.q > cursor:
+                    line.append(m21note.Rest(quarterLength=c.q - cursor))
+                if e.element is None:  # grace notes go before the event's first chunk
+                    gtype = "16th" if len(e.graces) > 1 else "eighth"
+                    for gp in e.graces:
+                        g = make_element(gp, names, grace_type=gtype)
+                        if mark_uncertain:
+                            g.style.color = UNCERTAIN_COLOR
+                        line.append(g)
+                el = make_element([n.pitch for n in c.notes], names, ql=c.dur)
+                if mark_uncertain and abs(e.pos - float(e.q)) > UNCERTAIN:
+                    el.style.color = UNCERTAIN_COLOR
+                    n_uncertain += e.element is None
+                c.element = el
+                if e.element is None:
+                    e.element = el
+                line.append(el)
+                cursor = c.q + c.dur
+            if total > cursor:
+                line.append(m21note.Rest(quarterLength=total - cursor))
+            if line is not part:
+                part.insert(0, line)
         parts[side] = part
 
     rh, lh = parts["R"], parts["L"]
@@ -805,6 +898,20 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
     rh.partName = "Piano"
     score.insert(0, layout.StaffGroup([rh, lh], name="Piano", symbol="brace", barTogether=True))
     score.makeNotation(inPlace=True)
+    for part in (rh, lh):  # bars where a hand has one voice are written without voices
+        for m in part.getElementsByClass(stream.Measure):
+            if m.voices and sum(1 for v in m.voices if v.notes) <= 1:
+                voices = list(m.voices)
+                keep = next((v for v in voices if v.notes), voices[0])
+                for v in voices:
+                    if v is not keep:
+                        m.remove(v)
+                m.flattenUnnecessaryVoices(force=True, inPlace=True)
+            for i, v in enumerate(m.voices):  # makeNotation numbers voices from 0, MusicXML from 1
+                v.id = i + 1
+                if i:  # the second voice's rests only clutter a piano texture
+                    for r in v.getElementsByClass(m21note.Rest):
+                        r.style.hideObjectOnPrint = True
     score.write("musicxml", fp=str(out_xml))
     score.write("midi", fp=str(out_mid))
     ibi = np.diff(beats)
