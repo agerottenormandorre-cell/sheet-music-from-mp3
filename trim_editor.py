@@ -7,7 +7,6 @@ selection can be played back (winsound, no extra libraries).
 
 import math
 import tempfile
-import threading
 import time
 import tkinter as tk
 import winsound
@@ -99,12 +98,35 @@ class Analysis:
         return math.floor(start * 100) / 100, math.floor(end * 100) / 100
 
 
-class TrimEditor(tk.Toplevel):
-    """on_done(start, duration) with duration 0 meaning "to the end"; on_cancel() otherwise."""
+def clamp_marker(key, t, start, end, dur):
+    """New (start, end) after moving one marker to t: 0.01 s grid, inside the file, in order."""
+    t = round(min(max(t, 0.0), dur) / STEP) * STEP
+    if key == "start":
+        return round(max(0.0, min(t, end - MIN_GAP)), 2), end
+    return start, round(min(dur, max(t, start + MIN_GAP)), 2)
 
-    def __init__(self, master, src, on_done, on_cancel, button, bounds=None):
+
+def draw_loudness(c, a, c0, c1, w, top, height, tags=()):
+    """Loudness of columns c0..c1 as a mirrored dB envelope, so quiet entries are visible."""
+    idx = np.clip(np.linspace(c0, c1, w + 1).astype(int), 0, len(a.peak) - 1)
+    peak = np.maximum.reduceat(a.peak, idx[:-1]) if idx[-1] > idx[0] else a.peak[idx[:-1]]
+    v = np.clip((20 * np.log10(peak + 1e-9) + 60) / 60, 0, 1)
+    mid, half = top + height / 2, height / 2 - 4
+    xs = np.arange(w)
+    pts = np.concatenate([np.stack([xs, mid - v * half], 1), np.stack([xs, mid + v * half], 1)[::-1]])
+    c.create_polygon(*pts.ravel().tolist(), fill=WAVE_C, outline="", tags=tags)
+
+
+def time_step(span, w, min_px):
+    return next((s for s in TICKS if s / span * w >= min_px), TICKS[-1])
+
+
+class TrimEditor(tk.Toplevel):
+    """Full view of one recording; "Подтвердить" calls on_done(start, end), "Закрыть" changes nothing."""
+
+    def __init__(self, master, src, analysis, bounds, on_done, button):
         super().__init__(master, bg=BG)
-        self.src, self.on_done, self.on_cancel, self.bounds0 = src, on_done, on_cancel, bounds
+        self.src, self.on_done, self.bounds0 = src, on_done, bounds
         self.button = button
         self.title(f"Границы — {src.name}")
         self.geometry(f"{min(1200, self.winfo_screenwidth() - 60)}x{min(720, self.winfo_screenheight() - 80)}")
@@ -118,15 +140,13 @@ class TrimEditor(tk.Toplevel):
         self.tmp_n = 0
         self.vars, self.mmss = {}, {}
         self.build()
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.protocol("WM_DELETE_WINDOW", self.close)
         for key, d in (("<Left>", -STEP), ("<Right>", STEP), ("<Shift-Left>", -0.1), ("<Shift-Right>", 0.1)):
             self.bind(key, lambda e, d=d: self.key_nudge(d))
         self.bind("<space>", self.key_play)
-        self.bind("<Escape>", lambda e: self.cancel())
+        self.bind("<Escape>", lambda e: self.close())
         self.bind("<Return>", lambda e: self.confirm())
-        self.result = None
-        threading.Thread(target=self.load, daemon=True).start()
-        self.after(50, self.wait_loaded)
+        self.after(1, lambda: self.loaded(analysis))
         self.grab_set()
         self.after(150, lambda: (self.lift(), self.focus_force()))  # keys work without a click first
 
@@ -172,8 +192,8 @@ class TrimEditor(tk.Toplevel):
                           ("▶ Последние 3 с", lambda: self.play_range(self.end - 3, self.end)),
                           ("■ Стоп", self.stop)):
             b(bottom, text, cmd, small=True).pack(side="left", padx=(0, 6))
-        b(bottom, "Распознать", self.confirm, primary=True).pack(side="right")
-        b(bottom, "Пропустить запись", self.cancel).pack(side="right", padx=8)
+        b(bottom, "Подтвердить", self.confirm, primary=True).pack(side="right")
+        b(bottom, "Закрыть", self.close).pack(side="right", padx=8)
 
         c = self.canvas
         c.bind("<Configure>", lambda e: self.redraw())
@@ -215,33 +235,13 @@ class TrimEditor(tk.Toplevel):
 
     # ---------------------------------------------------------------- loading
 
-    def load(self):
-        try:
-            self.result = Analysis(self.src)
-        except Exception as ex:
-            self.result = ex
-
-    def wait_loaded(self):
-        if not self.winfo_exists():
-            return
-        if self.result is None:
-            self.canvas.delete("all")
-            self.canvas.create_text(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
-                                    text="Строю спектр…", fill=MUTED, font=(FONT, 12))
-            self.after(80, self.wait_loaded)
-            return
-        if isinstance(self.result, Exception):
-            self.canvas.delete("all")
-            self.canvas.create_text(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
-                                    text=f"Не удалось открыть запись: {self.result}", fill=END_C, font=(FONT, 11))
-            return
-        self.a = self.result
+    def loaded(self, analysis):
+        self.update_idletasks()
+        self.a = analysis
         self.full = Image.fromarray(colormap()[self.a.spec])
         self.v0, self.v1 = 0.0, self.a.dur
-        s, e = self.bounds0 or self.a.auto
-        self.start, self.end = s, (e or self.a.dur)
-        self.info.config(text=f"длительность {fmt(self.a.dur)} ({self.a.dur:.2f} с)" +
-                         ("" if self.bounds0 else " · границы звука найдены автоматически — подвиньте при необходимости"))
+        self.start, self.end = self.bounds0
+        self.info.config(text=f"длительность {fmt(self.a.dur)} ({self.a.dur:.2f} с)")
         self.redraw()
         self.update_markers()
 
@@ -285,18 +285,12 @@ class TrimEditor(tk.Toplevel):
         c.tag_raise("flabel")
         # loudness strip, dB scale so quiet entries are visible
         c.create_rectangle(0, bottom, w, h, fill=BG, outline="")
-        idx = np.clip(np.linspace(c0, c1, w + 1).astype(int), 0, len(a.peak) - 1)
-        peak = np.maximum.reduceat(a.peak, idx[:-1]) if idx[-1] > idx[0] else a.peak[idx[:-1]]
-        v = np.clip((20 * np.log10(peak + 1e-9) + 60) / 60, 0, 1)
-        mid, half = bottom + WAVE / 2, WAVE / 2 - 6
-        xs = np.arange(w)
-        pts = np.concatenate([np.stack([xs, mid - v * half], 1), np.stack([xs, mid + v * half], 1)[::-1]])
-        c.create_polygon(*pts.ravel().tolist(), fill=WAVE_C, outline="")
+        draw_loudness(c, a, c0, c1, w, bottom, WAVE)
         c.create_text(w - 6, bottom + 4, text="громкость, дБ", anchor="ne", fill=MUTED, font=(FONT, 7))
         # time ruler
         c.create_rectangle(0, 0, w, top, fill=BG, outline="")
         span = self.v1 - self.v0
-        step = next((s for s in TICKS if s / span * w >= 90), TICKS[-1])
+        step = time_step(span, w, 90)
         decimals = 2 if step < 0.1 else 1 if step < 1 else 0
         t = math.ceil(self.v0 / step) * step
         while t <= self.v1:
@@ -348,11 +342,7 @@ class TrimEditor(tk.Toplevel):
     def set_marker(self, key, t):
         if not self.a:
             return
-        t = round(min(max(t, 0.0), self.a.dur) / STEP) * STEP
-        if key == "start":
-            self.start = round(max(0.0, min(t, self.end - MIN_GAP)), 2)
-        else:
-            self.end = round(min(self.a.dur, max(t, self.start + MIN_GAP)), 2)
+        self.start, self.end = clamp_marker(key, t, self.start, self.end, self.a.dur)
         self.active = key
         self.update_markers()
 
@@ -517,13 +507,92 @@ class TrimEditor(tk.Toplevel):
             self.entry_set(key)
         start, end = self.start, self.end
         self.close()
-        self.on_done(start, 0.0 if end >= self.a.dur - STEP else round(end - start, 2))
-
-    def cancel(self):
-        self.close()
-        self.on_cancel()
+        self.on_done(start, end)
 
     def close(self):
         self.stop()
         self.grab_release()
         self.destroy()
+
+
+class MiniTrim(tk.Canvas):
+    """Simple view for the main window: loudness of the whole recording with the two markers.
+
+    Left click sets the start, right click the end, markers can be dragged.
+    on_change(start, end) is called after every move.
+    """
+
+    HEIGHT = 64
+
+    def __init__(self, parent, analysis, bounds, on_change):
+        super().__init__(parent, height=self.HEIGHT, bg=BG, highlightthickness=0, cursor="crosshair")
+        self.a, self.on_change, self.dragging = analysis, on_change, None
+        self.start, self.end = bounds
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<ButtonPress-1>", lambda e: self.press(e, "start"))
+        self.bind("<ButtonPress-3>", lambda e: self.press(e, "end"))
+        self.bind("<B1-Motion>", self.drag)
+        self.bind("<B3-Motion>", self.drag)
+        self.bind("<ButtonRelease-1>", lambda e: setattr(self, "dragging", None))
+        self.bind("<ButtonRelease-3>", lambda e: setattr(self, "dragging", None))
+        self.bind("<Motion>", self.hover)
+
+    def x_of(self, t):
+        return t / self.a.dur * self.winfo_width()
+
+    def t_of(self, x):
+        return x / max(self.winfo_width(), 1) * self.a.dur
+
+    def set_bounds(self, start, end):
+        self.start, self.end = start, end
+        self.draw_markers()
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.HEIGHT
+        if w < 10:
+            return
+        draw_loudness(self, self.a, 0, self.a.dur / self.a.hop_s, w, 0, h)
+        step = time_step(self.a.dur, w, 70)
+        t = step
+        while t < self.a.dur:
+            x = self.x_of(t)
+            self.create_line(x, 0, x, h, fill=GRID, dash=(2, 4))
+            t += step
+        self.create_text(w - 6, 3, text="громкость, дБ", anchor="ne", fill=MUTED, font=(FONT, 7))
+        self.draw_markers()
+
+    def draw_markers(self):
+        self.delete("marker")
+        w, h = self.winfo_width(), self.HEIGHT
+        xs, xe = self.x_of(self.start), self.x_of(self.end)
+        for x0, x1 in ((0, xs), (xe, w)):
+            if x1 > x0:
+                self.create_rectangle(x0, 0, x1, h, fill="#000000", stipple="gray50", outline="", tags="marker")
+        for x, color, text, anchor in ((xs, START_C, f"Н {fmt(self.start)}", "nw"),
+                                       (xe, END_C, f"К {fmt(self.end)}", "ne")):
+            self.create_line(x, 0, x, h, fill=color, width=2, tags="marker")
+            tx = min(max(x + 4, 2), w - 120) if anchor == "nw" else max(min(x - 4, w - 2), 120)
+            label = self.create_text(tx, h - 3, text=text, anchor="s" + anchor[1], fill=BG,
+                                     font=("Consolas", 8, "bold"), tags="marker")
+            box = self.bbox(label)
+            self.tag_lower(self.create_rectangle(box[0] - 2, box[1], box[2] + 2, box[3], fill=color, outline=color,
+                                                 tags="marker"), label)
+
+    def press(self, e, default):
+        near = min((abs(self.x_of(getattr(self, k)) - e.x), k) for k in ("start", "end"))
+        self.dragging = near[1] if near[0] <= 6 else default
+        self.move(e.x)
+
+    def drag(self, e):
+        if self.dragging:
+            self.move(min(max(e.x, 0), self.winfo_width()))
+
+    def move(self, x):
+        self.start, self.end = clamp_marker(self.dragging, self.t_of(x), self.start, self.end, self.a.dur)
+        self.draw_markers()
+        self.on_change(self.start, self.end)
+
+    def hover(self, e):
+        near = min(abs(self.x_of(getattr(self, k)) - e.x) for k in ("start", "end"))
+        self.config(cursor="sb_h_double_arrow" if near <= 6 or self.dragging else "crosshair")

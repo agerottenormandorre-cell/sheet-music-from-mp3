@@ -18,7 +18,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from trim_editor import TrimEditor, fmt
+from trim_editor import STEP, Analysis, MiniTrim, TrimEditor, fmt
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out"
@@ -30,7 +30,7 @@ AUTHOR_EMAIL = "astramixofficial@gmail.com"
 
 # stage -> (share of the progress bar where it starts, where it ends, typical seconds, label)
 STAGES = {
-    "trim":   (0.00, 0.00, 1, "ждёт выбора границ"),
+    "trim":   (0.00, 0.00, 1, "выбор границ"),
     "queued": (0.00, 0.00, 1, "в очереди"),
     "decode": (0.00, 0.05, 1, "читаю запись"),
     "notes":  (0.05, 0.65, 8, "распознаю ноты"),
@@ -245,6 +245,7 @@ class Item(tk.Frame):
         super().__init__(parent, bg=CARD, highlightbackground=LINE, highlightthickness=1)
         self.app, self.src, self.opts, self.out = app, src, opts, None
         self.stage, self.since, self.ticket = "new", time.time(), 0
+        self.analysis, self.bounds, self.mini, self.previous = None, None, None, None
         self.columnconfigure(0, weight=1)
         top = tk.Frame(self, bg=CARD)
         top.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
@@ -272,16 +273,103 @@ class Item(tk.Frame):
         return f" · фрагмент {fmt(start)}–{fmt(start + duration) if duration else 'конец'}"
 
     def wait_trim(self):
+        """Simple loudness view with start/end markers; recognition starts with "Распознать"."""
         self.stage = "trim"
-        self.status.config(text=STAGES["trim"][3] + self.bounds_text(), fg=MUTED)
-        self.show_actions([("✕", self.drop, False)])
+        self.bar.grid_remove()
+        if self.analysis:
+            self.show_mini()
+            return
+        self.status.config(text="строю график громкости…", fg=MUTED)
+        self.show_actions([self.cancel_button()])
+        threading.Thread(target=self.analyze, daemon=True).start()
+
+    def analyze(self):
+        try:
+            result = Analysis(self.src)
+        except Exception as ex:
+            traceback.print_exc()
+            result = ex
+        self.app.events.put(("analysis", self, result))
+
+    def analysis_ready(self, result):
+        if self.stage != "trim":
+            return
+        if isinstance(result, Exception):
+            self.status.config(text=f"не удалось открыть запись: {result}", fg=ERR)
+            return
+        self.analysis = result
+        self.show_mini()
+
+    def show_mini(self):
+        a, o = self.analysis, self.opts
+        if self.previous and (o["start"] or o["duration"]):
+            self.bounds = (o["start"], o["start"] + o["duration"] if o["duration"] else round(a.dur, 2))
+        elif self.previous:
+            self.bounds = (0.0, round(a.dur, 2))
+        else:
+            self.bounds = a.auto
+        if self.mini:
+            self.mini.destroy()
+        self.mini = MiniTrim(self, a, self.bounds, self.set_bounds)
+        self.mini.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        self.show_actions([("Полный", self.full, False), ("Распознать", self.recognize, True), self.cancel_button()])
+        self.show_bounds()
+
+    def cancel_button(self):
+        return ("Отмена", self.cancel_edit, False) if self.previous else ("✕", self.drop, False)
+
+    def show_bounds(self):
+        s, e = self.bounds
+        self.status.config(text=f"начало {s:.2f} с · конец {e:.2f} с · выбрано {fmt(e - s)}   "
+                                "(ЛКМ — начало, ПКМ — конец, маркеры можно тянуть)", fg=MUTED)
+
+    def set_bounds(self, start, end):
+        self.bounds = (start, end)
+        if self.mini:
+            self.mini.set_bounds(start, end)
+        self.show_bounds()
+
+    def full(self):
+        TrimEditor(self.app.root, self.src, self.analysis, self.bounds, self.set_bounds, Button)
+
+    def recognize(self):
+        if self.stage != "trim" or not self.analysis:
+            return
+        s, e = self.bounds
+        new = dict(start=s, duration=0.0 if e >= self.analysis.dur - STEP else round(e - s, 2))
+        if any(self.opts[k] != v for k, v in new.items()):
+            self.opts.update(new, rescore=False)  # other bounds need new recognition
+        self.analysis, self.previous = None, None  # frees the decoded audio
+        self.app.enqueue(self)
+
+    def cancel_edit(self):
+        previous, self.previous, self.analysis = self.previous, None, None
+        if previous == "done":
+            self.finish(self.out, self.info)
+        elif previous == "failed":
+            self.fail(self.error)
+        else:
+            self.app.enqueue(self)
+        self.app.update_state()
+
+    def edit(self):
+        if self.stage in ("queued", "done", "failed"):
+            self.previous = self.stage
+            self.wait_trim()
+            self.app.update_state()
+
+    def hide_mini(self):
+        if self.mini:
+            self.mini.destroy()
+            self.mini = None
 
     def queue(self):
+        self.hide_mini()
         self.stage, self.out = "queued", None
         self.bar["value"] = 0
         self.bar.grid()
         self.status.config(text="в очереди" + self.bounds_text(), fg=MUTED)
-        self.show_actions([("Границы…", lambda: self.app.edit(self), False), ("✕", self.drop, False)])
+        self.show_actions([("Границы…", self.edit, False), ("✕", self.drop, False)])
 
     def drop(self):
         self.app.remove(self)
@@ -300,6 +388,7 @@ class Item(tk.Frame):
 
     def finish(self, out, info):
         self.stage, self.out, self.info = "done", out, info
+        self.hide_mini()
         self.bar.grid_remove()
         text = f"готово · тактов: {info.get('bars')} · {info.get('meter')} · ♩≈{info.get('bpm')}"
         if info.get("key"):
@@ -311,7 +400,7 @@ class Item(tk.Frame):
                    for label, name in (("Ноты PDF", "score.pdf"), ("Открыть в редакторе", "score.musicxml"),
                                        ("Послушать", "performance.mid")) if (out / name).exists()]
         self.show_actions(buttons + [("Папка", lambda: open_path(out), False),
-                                     ("Границы…", lambda: self.app.edit(self), False)])
+                                     ("Границы…", self.edit, False)])
 
     def open(self, name):
         if not open_path(self.out / name) and name == "score.musicxml":
@@ -319,9 +408,11 @@ class Item(tk.Frame):
 
     def fail(self, msg):
         self.stage, self.error = "failed", msg
+        self.hide_mini()
         self.bar["value"] = 0
+        self.bar.grid()
         self.status.config(text="ошибка: " + msg[:120], fg=ERR)
-        self.show_actions([("Журнал", self.app.show_log, False), ("Границы…", lambda: self.app.edit(self), False),
+        self.show_actions([("Журнал", self.app.show_log, False), ("Границы…", self.edit, False),
                            ("✕", self.drop, False)])
 
 
@@ -330,14 +421,13 @@ class Item(tk.Frame):
 class App:
     def __init__(self, root, initial):
         self.root, self.items, self.events = root, [], queue.Queue()
-        self.pending, self.editor = [], None  # recordings waiting for their bounds; the open editor
         self.dropped = queue.Queue()
         sys.stdout = sys.stderr = Log(self.events)
         self.worker = Worker(self.events)
 
         root.title(TITLE)
         root.configure(bg=BG)
-        root.geometry("900x700")
+        root.geometry("920x800")
         root.minsize(620, 480)
         try:
             root.iconbitmap(default=str(ROOT / "app.ico"))
@@ -381,7 +471,7 @@ class App:
         self.trim = tk.BooleanVar(value=True)
         opts2 = tk.Frame(root, bg=BG)
         opts2.pack(fill="x", padx=24)
-        for frame, text, var in ((opts, "Выбирать начало и конец по спектру перед распознаванием", self.trim),
+        for frame, text, var in ((opts, "Выбирать начало и конец перед распознаванием", self.trim),
                                  (opts, "Подсвечивать сомнительные ноты", self.marks),
                                  (opts2, "Делать PDF", self.pdf),
                                  (opts2, "Не распознавать заново, только пересобрать ноты", self.rescore)):
@@ -407,8 +497,10 @@ class App:
                            padx=10, pady=8, wrap="word")
         self.log_visible = False
 
-        tk.Label(root, text="Очередь", bg=BG, fg=MUTED, font=(FONT, 9, "bold")).pack(anchor="w", padx=24,
-                                                                                   pady=(14, 4))
+        qhead = tk.Frame(root, bg=BG)
+        qhead.pack(fill="x", padx=24, pady=(14, 4))
+        tk.Label(qhead, text="Очередь", bg=BG, fg=MUTED, font=(FONT, 9, "bold")).pack(side="left")
+        Button(qhead, "Распознать все", self.recognize_all, small=True).pack(side="right")
         box = tk.Frame(root, bg=BG)
         box.pack(fill="both", expand=True, padx=24)
         self.canvas = tk.Canvas(box, bg=BG, highlightthickness=0)
@@ -455,63 +547,23 @@ class App:
             self.items.append(item)
             if self.trim.get():
                 item.wait_trim()
-                self.pending.append(item)
             else:
                 self.enqueue(item)
-        self.next_editor()
         self.update_state()
 
     def enqueue(self, item):
         item.queue()
         item.ticket += 1
         self.worker.jobs.put((item, item.ticket))
+        self.update_state()
 
-    def edit(self, item):
-        """New bounds for a queued, finished or failed recording."""
-        if item.stage in ("queued", "done", "failed"):
-            item.previous = item.stage
-            item.wait_trim()
-            self.pending.insert(0, item)
-            self.next_editor()
-
-    def next_editor(self):
-        """One editor at a time; the next recording waiting for bounds opens when it closes."""
-        if self.editor and self.editor.winfo_exists():
-            self.editor.lift()
-            return
-        self.editor = None
-        while self.pending:
-            item = self.pending.pop(0)
-            if item.stage == "trim" and item.winfo_exists():
-                break
-        else:
-            return
-        o = item.opts
-        bounds = (o["start"], o["start"] + o["duration"] if o["duration"] else 0) if o["start"] or o["duration"] else None
-        self.editor = TrimEditor(self.root, item.src, lambda s, d: self.trimmed(item, s, d),
-                                 lambda: self.trim_skipped(item), Button, bounds)
-
-    def trimmed(self, item, start, duration):
-        if item.winfo_exists():
-            item.opts.update(start=start, duration=duration, rescore=False)  # new bounds need new recognition
-            self.enqueue(item)
-            self.update_state()
-        self.root.after(1, self.next_editor)
-
-    def trim_skipped(self, item):
-        """A new recording is dropped from the list; an edited one keeps its previous state."""
-        if item.winfo_exists():
-            previous = getattr(item, "previous", None)
-            if previous == "queued":
-                item.queue()  # its ticket is still in the worker's queue
-            elif previous == "done":
-                item.finish(item.out, item.info)
-            elif previous == "failed":
-                item.fail(item.error)
-            else:
-                self.remove(item)
-            item.previous = None
-        self.root.after(1, self.next_editor)
+    def recognize_all(self):
+        """Every recording still waiting for its bounds goes with the bounds shown."""
+        waiting = [i for i in self.items if i.stage == "trim" and i.analysis]
+        for item in waiting:
+            item.recognize()
+        if not waiting:
+            self.toast("Нет записей, ожидающих распознавания")
 
     def remove(self, item):
         item.stage = "removed"
@@ -544,9 +596,10 @@ class App:
     def update_state(self):
         if not hasattr(self, "device_name"):
             return
-        busy = [i for i in self.items if i.stage not in ("done", "failed", "removed")]
-        self.state.config(text=f"{len(busy)} в работе · {self.device_name}" if busy else
-                          f"Готово к работе · {self.device_name}")
+        busy = sum(i.stage not in ("done", "failed", "removed", "trim") for i in self.items)
+        waiting = sum(i.stage == "trim" for i in self.items)
+        parts = ([f"в работе: {busy}"] if busy else []) + ([f"ждут «Распознать»: {waiting}"] if waiting else [])
+        self.state.config(text=" · ".join(parts or ["Готово к работе"]) + f" · {self.device_name}")
 
     # ---------------------------------------------------------------- event loop
 
@@ -566,7 +619,7 @@ class App:
                 self.state.config(text=args[0], fg=ERR)
                 self.show_log()
             elif args[0].winfo_exists() and args[0].stage != "removed":
-                getattr(args[0], {"stage": "set_stage", "done": "finish", "fail": "fail"}[kind])(*args[1:])
+                getattr(args[0], {"stage": "set_stage", "done": "finish", "fail": "fail", "analysis": "analysis_ready"}[kind])(*args[1:])
                 self.update_state()
         for item in self.items:
             item.tick()
