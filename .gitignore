@@ -1,0 +1,5 @@
+.venv
+__pycache__
+out/*
+badapple.mp3
+setup_log.txt
