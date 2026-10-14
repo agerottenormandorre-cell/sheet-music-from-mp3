@@ -22,6 +22,7 @@ Output per recording, in out/<name>/:
 """
 
 import argparse
+import bisect
 import math
 import shutil
 import subprocess
@@ -68,6 +69,10 @@ UNCERTAIN_COLOR = "#C2185B"
 LEGATO_GAP = Fraction(1, 2)  # rests shorter than this (in beats) are absorbed into the note
 VOICE_HOLD = Fraction(1, 2)  # a key held this long (beats) after the hand's next onset is a voice ...
 VOICE_MIN = Fraction(1)      # ... if it lasts at least this long
+# bar lengths (beats) the meter tracker may choose, with their cost per bar; 2/4 is
+# mostly written as 4/4 (2/4 bars are too short to read at these tempi)
+METERS = {4: 0.0, 3: 0.3, 2: 1.5}
+METER_CHANGE = 6.0     # cost of a change of meter (log probability units)
 # MIDI velocity upper bounds for dynamics
 DYNAMICS = [(45, "pp"), (56, "p"), (66, "mp"), (78, "mf"), (90, "f"), (128, "ff")]
 
@@ -185,21 +190,88 @@ def dp_beats(act, fps_in=BEAT_FPS, fps=DP_FPS, beta=60.0, gamma=1.5):
     return np.array(beats[::-1]) / fps, T
 
 
-def meter_and_phase(beats, down):
-    """Beats per bar and which beat is the downbeat, from downbeat probabilities.
-    Duple meters are written as 4/4 (2/4 bars are too short to read at these tempi)."""
-    idx = np.clip(np.round(beats * BEAT_FPS).astype(int), 0, len(down) - 1)
-    d = down[idx]
+def downbeat_strength(beats, down):
+    """Downbeat probability at each beat (strongest frame within 40 ms)."""
+    out = []
+    for t in beats:
+        i = int(round(t * BEAT_FPS))
+        out.append(float(down[max(0, i - 2):i + 3].max()) if len(down) else 0.0)
+    return np.array(out)
 
-    def contrast(m, p):
-        on = d[p::m]
-        off = np.delete(d, np.arange(p, len(d), m))
-        return on.mean() - off.mean() if len(on) and len(off) else -np.inf
 
-    duple = max(contrast(2, p) for p in range(2))
-    triple = max(contrast(3, p) for p in range(3))
-    m = 3 if triple > duple + 0.05 else 4
-    return m, int(np.argmax([contrast(m, p) for p in range(m)]))
+def track_bars(beats, down):
+    """Where the bars start and how many beats each has (2, 3 or 4), over the whole piece.
+
+    Viterbi over (bar length, beat in bar): a bar line where the downbeat probability is
+    high; a change of bar length costs METER_CHANGE, so the meter only changes where the
+    downbeats keep saying so. Returns (index of the first downbeat, list of bar lengths
+    from there to the last beat)."""
+    d = downbeat_strength(beats, down)
+    on, off = np.log(d + 0.05), np.log(1.05 - d)
+    states = [(m, k) for m in METERS for k in range(m)]
+    S = len(states)
+    score = np.array([on[0] if k == 0 else off[0] for m, k in states]) - [METERS[m] * (k == 0) for m, k in states]
+    back = []
+    for i in range(1, len(beats)):
+        new = np.full(S, -np.inf)
+        bp = np.zeros(S, dtype=int)
+        for j, (m, k) in enumerate(states):
+            if k > 0:
+                src = states.index((m, k - 1))
+                new[j], bp[j] = score[src], src
+            else:  # a bar starts: from the last beat of any bar
+                for m0 in METERS:
+                    src = states.index((m0, m0 - 1))
+                    v = score[src] - METERS[m] - (METER_CHANGE if m0 != m else 0)
+                    if v > new[j]:
+                        new[j], bp[j] = v, src
+            new[j] += on[i] if k == 0 else off[i]
+        score = new
+        back.append(bp)
+    j = int(np.argmax(score))
+    path = [j]
+    for bp in reversed(back):
+        j = int(bp[j])
+        path.append(j)
+    path.reverse()
+    starts = [i for i, j in enumerate(path) if states[j][1] == 0]
+    if not starts:
+        return 0, [4]
+    lengths = [states[path[i]][0] for i in starts]
+    return starts[0], lengths
+
+
+class Bars:
+    """The bar lines of the score: start (in beats from the score's start) and length of each bar."""
+
+    def __init__(self, lengths):
+        self.lengths = list(lengths) or [4]
+        self.starts = [Fraction(0)]
+        for m in self.lengths[:-1]:
+            self.starts.append(self.starts[-1] + m)
+
+    def extend_to(self, end):
+        while self.end < end:
+            self.starts.append(self.end)
+            self.lengths.append(self.lengths[-1])
+
+    @property
+    def end(self):
+        return self.starts[-1] + self.lengths[-1]
+
+    def index(self, q):
+        """Bar containing score position q (positions before the first bar map to bar 0)."""
+        return max(0, bisect.bisect_right(self.starts, q) - 1)
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def signature(self):
+        names = []
+        for m in self.lengths:
+            if not names or names[-1] != f"{m}/4":
+                names.append(f"{m}/4")
+        return ", ".join(dict.fromkeys(names))
 
 
 # ------------------------------------------------------------------ quantization
@@ -686,12 +758,16 @@ def note_values(chunks, total):
             c.dur = end - c.q
 
 
-def arrange(hands, beat_of, bar):
-    """Quantized events of both hands -> ({"L"/"R": Chunks with note values}, total length)."""
+def arrange(hands, beat_of, bars):
+    """Quantized events of both hands -> ({"L"/"R": Chunks with note values}, total length).
+    `bars` is cut or extended to end with the bar holding the last note."""
     chunks = {side: split_voices(evs, beat_of) for side, evs in hands.items()}
     last_end = max((c.q + max(Fraction(round(c.end_pos * 2), 2) - c.q, Fraction(1, c.event.sub))
-                    for cs in chunks.values() for c in cs), default=Fraction(bar))
-    total = Fraction(max(1, math.ceil(last_end / bar)) * bar)
+                    for cs in chunks.values() for c in cs), default=Fraction(1))
+    bars.extend_to(last_end)
+    n = bars.index(last_end - Fraction(1, 96)) + 1
+    del bars.lengths[n:], bars.starts[n:]
+    total = bars.end
     for cs in chunks.values():
         note_values(cs, total)
     return chunks, total
@@ -759,23 +835,27 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
     t_end = max(n.end for n in notes)
 
     beats, T = dp_beats(act)
-    bar, phase = meter_and_phase(beats, down)
+    first_down, lengths = track_bars(beats, down)
     grid, n_pre = extend_beats(beats, t_end)
     idx = np.arange(len(grid), dtype=float)
     to_beat = lambda t: float(np.interp(t, grid, idx))
 
     # the score starts on the last downbeat at or before the first note
     first = to_beat(notes[0].start)
-    origin = n_pre + phase
+    origin = n_pre + first_down
     while origin > first + 0.25:
-        origin -= bar
+        origin -= lengths[0]
+        lengths.insert(0, lengths[0])
+    while len(lengths) > 1 and origin + lengths[0] <= first + 0.25:
+        origin += lengths.pop(0)
+    bars = Bars(lengths)
     beat_of = lambda t: to_beat(t) - origin
 
     hands, grid = quantize(notes, grid, origin)
     to_beat = lambda t: float(np.interp(t, grid, idx))
     beat_of = lambda t: to_beat(t) - origin
 
-    chunks, total = arrange(hands, beat_of, bar)
+    chunks, total = arrange(hands, beat_of, bars)
 
     # key from the performance itself, then spell every pitch in it
     probe = stream.Stream()
@@ -791,7 +871,10 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         part = stream.PartStaff(id=side)  # two PartStaffs export as one piano part
         part.append(clef.TrebleClef() if side == "R" else clef.BassClef())
         part.append(key.KeySignature(k.sharps))
-        part.append(meter.TimeSignature(f"{bar}/4"))
+        part.append(meter.TimeSignature(f"{bars.lengths[0]}/4"))
+        for b in range(1, len(bars)):
+            if bars.lengths[b] != bars.lengths[b - 1]:
+                part.insert(bars.starts[b], meter.TimeSignature(f"{bars.lengths[b]}/4"))
         used = sorted({c.voice for c in chunks[side]}) or [1]
         for v in used:
             line = stream.Voice(id=v) if len(used) > 1 else part
@@ -823,14 +906,14 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         parts[side] = part
 
     rh, lh = parts["R"], parts["L"]
-    n_bars = int(total / bar)
+    n_bars = len(bars)
 
     # clef changes: a hand that stays out of its staff's range for a bar or more
     # switches clef (with hysteresis), as an engraver would
     for side, part in (("R", rh), ("L", lh)):
         pitches_by_bar = defaultdict(list)
         for e in hands[side]:
-            pitches_by_bar[int(e.q // bar)] += [n.pitch for n in e.notes]
+            pitches_by_bar[bars.index(e.q)] += [n.pitch for n in e.notes]
         treble = side == "R"
         for b in range(n_bars):
             ps = pitches_by_bar.get(b)
@@ -841,27 +924,27 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
                 treble = not treble
                 if b == 0:
                     part.remove(part.getElementsByClass(clef.Clef).first())
-                part.insert(b * bar, clef.TrebleClef() if treble else clef.BassClef())
+                part.insert(bars.starts[b], clef.TrebleClef() if treble else clef.BassClef())
 
     # tempo: 3-bar median of the tracked tempo; a new mark only for a lasting change > 15%
     beat_t = lambda b: float(np.interp(b + origin, idx, grid))
     tracked_end = len(beats) - 1 + n_pre - origin
-    bar_bpm = [60.0 * bar / (beat_t((i + 1) * bar) - beat_t(i * bar)) for i in range(n_bars)
-               if (i + 1) * bar <= tracked_end]
+    bar_bpm = [60.0 * m / (beat_t(float(b0 + m)) - beat_t(float(b0)))
+               for b0, m in zip(bars.starts, bars.lengths) if b0 + m <= tracked_end]
     printed = None
     for i in range(len(bar_bpm)):
         smooth = np.median(bar_bpm[max(0, i - 1):i + 2])
         nxt = np.median(bar_bpm[i:i + 3])
         if printed is None or (abs(smooth / printed - 1) > 0.15 and abs(nxt / printed - 1) > 0.15):
             printed = int(round(smooth))
-            rh.insert(i * bar, tempo.MetronomeMark(number=printed))
+            rh.insert(bars.starts[i], tempo.MetronomeMark(number=printed))
     if printed is None:
         rh.insert(0, tempo.MetronomeMark(number=round(60 / T)))
 
     # dynamics: 3-bar median velocity, with hysteresis so the level does not flicker
     vel_by_bar = defaultdict(list)
     for n in notes:
-        vel_by_bar[int(beat_of(n.start) // bar)].append(n.velocity)
+        vel_by_bar[bars.index(beat_of(n.start))].append(n.velocity)
     bounds = [0] + [hi for hi, _ in DYNAMICS]
     level = None
     for b in range(n_bars):
@@ -874,7 +957,7 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
         new = next(i for i, (hi, _) in enumerate(DYNAMICS) if v < hi)
         if new != level:
             level = new
-            rh.insert(b * bar, dynamics.Dynamic(DYNAMICS[new][1]))
+            rh.insert(bars.starts[b], dynamics.Dynamic(DYNAMICS[new][1]))
 
     # sustain pedal: Ped. ... * spanning the left-hand notes it holds
     downs = sorted((c.time, c.value) for c in inst.control_changes if c.number == 64)
@@ -916,7 +999,7 @@ def build_score(mid_path, act, down, out_xml, out_mid, mark_uncertain=True):
     score.write("midi", fp=str(out_mid))
     ibi = np.diff(beats)
     return dict(notes=len(notes), bpm=round(60 / T), tempo_range=f"{60 / ibi.max():.0f}-{60 / ibi.min():.0f}",
-                meter=f"{bar}/4", key=str(k), bars=n_bars, uncertain=n_uncertain)
+                meter=bars.signature(), key=str(k), bars=n_bars, uncertain=n_uncertain)
 
 
 # ------------------------------------------------------------------ PDF preview

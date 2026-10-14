@@ -174,7 +174,7 @@ def run(name, seed, verbose=False, hard=False):
     grid, n_pre = tr.extend_beats(tracked, max(n.end for n in notes))
     hands, grid = tr.quantize(notes, grid, n_pre)
     idx = np.arange(len(grid), dtype=float)
-    chunks, _ = tr.arrange(hands, lambda t: float(np.interp(t, grid, idx)) - n_pre, 4)
+    chunks, _ = tr.arrange(hands, lambda t: float(np.interp(t, grid, idx)) - n_pre, tr.Bars([4]))
     written = {id(n): c.dur for cs in chunks.values() for c in cs for n in c.notes}
 
     placed = {}
