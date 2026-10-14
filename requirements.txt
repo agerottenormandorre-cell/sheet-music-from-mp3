@@ -1,0 +1,15 @@
+# Versions the program was tested with. PyTorch (torch, torchaudio) is installed by
+# setup.ps1 from the PyTorch index: the CUDA build for NVIDIA cards, the CPU build otherwise.
+# transkun is installed separately with --no-deps (its training-only dependency ncls
+# does not build on Windows).
+numpy==2.4.6
+pretty_midi==0.2.11.post0
+music21==10.5.0
+soundfile==0.14.0
+soxr==1.1.0
+moduleconf==0.1.4
+beat-this==1.1.0
+einops==0.8.2
+rotary-embedding-torch==0.9.1
+verovio==6.3.0
+pillow==12.2.0
