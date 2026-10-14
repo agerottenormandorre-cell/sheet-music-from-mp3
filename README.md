@@ -12,7 +12,7 @@
 
 ![Главное окно](docs/images/main.png)
 
-![Фрагмент результата](docs/images/score.png)
+![Начало импровизации на тему Bad Apple!!](docs/images/score.png)
 
 ## Возможности
 
