@@ -98,6 +98,29 @@ class Analysis:
         return math.floor(start * 100) / 100, math.floor(end * 100) / 100
 
 
+def parse_time(text):
+    """'12.34', '12,34', '1:05.37' or '1:02:05.37' -> seconds; None if it is not a time."""
+    try:
+        t = 0.0
+        for part in text.strip().replace(",", ".").split(":"):
+            t = t * 60 + float(part)
+        return t if t >= 0 else None
+    except ValueError:
+        return None
+
+
+def duration_text(t):
+    """Hours and minutes only when there are any: '1 ч 02 мин 05.37 с', '2 мин 01.34 с', '41.20 с'."""
+    cents = round(t * 100)
+    h, rest = divmod(cents, 360000)
+    m, c = divmod(rest, 6000)
+    if h:
+        return f"{h} ч {m:02d} мин {c / 100:05.2f} с"
+    if m:
+        return f"{m} мин {c / 100:05.2f} с"
+    return f"{c / 100:.2f} с"
+
+
 def clamp_marker(key, t, start, end, dur):
     """New (start, end) after moving one marker to t: 0.01 s grid, inside the file, in order."""
     t = round(min(max(t, 0.0), dur) / STEP) * STEP
@@ -353,14 +376,8 @@ class TrimEditor(tk.Toplevel):
             self.focus_on(key, keep_zoom=True)
 
     def entry_set(self, key):
-        try:
-            text = self.vars[key].get().strip().replace(",", ".")
-            if ":" in text:
-                m, s = text.split(":")
-                t = int(m) * 60 + float(s)
-            else:
-                t = float(text)
-        except ValueError:
+        t = parse_time(self.vars[key].get())
+        if t is None:
             self.update_markers()
             return
         self.set_marker(key, t)

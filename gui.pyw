@@ -18,7 +18,7 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from trim_editor import STEP, Analysis, MiniTrim, TrimEditor, fmt
+from trim_editor import STEP, Analysis, MiniTrim, TrimEditor, clamp_marker, duration_text, fmt, parse_time
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "out"
@@ -308,10 +308,34 @@ class Item(tk.Frame):
             self.bounds = (0.0, round(a.dur, 2))
         else:
             self.bounds = a.auto
-        if self.mini:
-            self.mini.destroy()
-        self.mini = MiniTrim(self, a, self.bounds, self.set_bounds)
-        self.mini.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        self.hide_mini()
+        # start / end fields with arrows, the loudness strip under them, the duration under that
+        box = self.trim_box = tk.Frame(self, bg=CARD)
+        box.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        box.columnconfigure(0, weight=1)
+        fields = tk.Frame(box, bg=CARD)
+        fields.grid(row=0, column=0, sticky="w", pady=(2, 6))
+        self.spins = {}
+        for key, title, color in (("start", "Начало", "#1E9E6A"), ("end", "Конец", "#D63F8C")):
+            tk.Label(fields, text="▌", bg=CARD, fg=color, font=(FONT, 11)).pack(side="left")
+            tk.Label(fields, text=title, bg=CARD, fg=INK, font=(FONT, 10, "bold")).pack(side="left", padx=(0, 6))
+            var = tk.StringVar()
+            spin = tk.Spinbox(fields, textvariable=var, from_=0, to=round(a.dur, 2), increment=STEP, format="%.2f",
+                              width=8, font=("Consolas", 13), justify="right", relief="flat", bg="#FBFAFF",
+                              buttonbackground=ACCENT_SOFT, highlightthickness=1, highlightbackground=LINE,
+                              highlightcolor=ACCENT, command=lambda k=key: self.spin_set(k))
+            spin.pack(side="left", ipady=5)
+            spin.bind("<Return>", lambda e, k=key: self.spin_set(k))
+            spin.bind("<FocusOut>", lambda e, k=key: self.spin_set(k))
+            spin.bind("<MouseWheel>", lambda e, k=key: self.spin_step(k, STEP if e.delta > 0 else -STEP))
+            tk.Label(fields, text="с", bg=CARD, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=(4, 22))
+            self.spins[key] = var
+        self.mini = MiniTrim(box, a, self.bounds, self.set_bounds)
+        self.mini.grid(row=1, column=0, sticky="ew")
+        self.length = tk.Label(box, text="", bg=CARD, fg=INK, font=(FONT, 10), anchor="w")
+        self.length.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.status.config(text="выбор границ · на графике: ЛКМ — начало, ПКМ — конец, маркеры можно тянуть",
+                           fg=MUTED)
         self.show_actions([("Полный", self.full, False), ("Распознать", self.recognize, True), self.cancel_button()])
         self.show_bounds()
 
@@ -320,8 +344,25 @@ class Item(tk.Frame):
 
     def show_bounds(self):
         s, e = self.bounds
-        self.status.config(text=f"начало {s:.2f} с · конец {e:.2f} с · выбрано {fmt(e - s)}   "
-                                "(ЛКМ — начало, ПКМ — конец, маркеры можно тянуть)", fg=MUTED)
+        self.spins["start"].set(f"{s:.2f}")
+        self.spins["end"].set(f"{e:.2f}")
+        self.length.config(text=f"Длительность: {duration_text(e - s)}"
+                                f"   (вся запись {duration_text(self.analysis.dur)})")
+
+    def spin_set(self, key):
+        """Arrow click, Enter or leaving the field: the typed or stepped value becomes the bound."""
+        if self.stage != "trim" or not self.analysis:
+            return
+        t = parse_time(self.spins[key].get())
+        if t is not None:
+            self.set_bounds(*clamp_marker(key, t, *self.bounds, self.analysis.dur))
+        else:
+            self.show_bounds()
+
+    def spin_step(self, key, d):
+        t = self.bounds[0 if key == "start" else 1] + d
+        self.set_bounds(*clamp_marker(key, t, *self.bounds, self.analysis.dur))
+        return "break"
 
     def set_bounds(self, start, end):
         self.bounds = (start, end)
@@ -360,7 +401,7 @@ class Item(tk.Frame):
 
     def hide_mini(self):
         if self.mini:
-            self.mini.destroy()
+            self.trim_box.destroy()
             self.mini = None
 
     def queue(self):
