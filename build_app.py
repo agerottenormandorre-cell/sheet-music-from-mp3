@@ -11,6 +11,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from version import VERSION
+
 ROOT = Path(__file__).resolve().parent
 ICON = ROOT / "app.ico"
 EXE = ROOT / "Ноты из записи.exe"
@@ -28,7 +30,7 @@ using System.Reflection;
 [assembly: AssemblyProduct("Ноты из записи")]
 [assembly: AssemblyCompany("Астрамикс")]
 [assembly: AssemblyCopyright("Автор: Астрамикс, astramixofficial@gmail.com")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyVersion("{version}.0.0")]
 
 class Launcher {
     [STAThread]
@@ -100,7 +102,7 @@ def build_exe():
     if not CSC.exists():
         sys.exit("C# compiler not found: " + str(CSC))
     src = ROOT / ".venv" / "launcher.cs"
-    src.write_text(LAUNCHER, encoding="utf-8-sig")
+    src.write_text(LAUNCHER.replace("{version}", VERSION), encoding="utf-8-sig")
     subprocess.run([str(CSC), "/nologo", "/target:winexe", "/optimize", "/codepage:65001",
                     f"/win32icon:{ICON}", f"/out:{EXE}", "/reference:System.Windows.Forms.dll", str(src)],
                    check=True)

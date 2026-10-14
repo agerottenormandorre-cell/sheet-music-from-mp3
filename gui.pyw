@@ -19,6 +19,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 from beat_editor import BeatEditor
+from version import VERSION
 from trim_editor import STEP, Analysis, MiniTrim, TrimEditor, clamp_marker, duration_text, fmt, parse_time
 
 ROOT = Path(__file__).resolve().parent
@@ -531,7 +532,8 @@ class App:
 
         credits = tk.Frame(root, bg=BG)
         credits.pack(side="bottom", fill="x", padx=24, pady=(0, 12))
-        tk.Label(credits, text=f"Автор программы: {AUTHOR} ·", bg=BG, fg=MUTED, font=(FONT, 8)).pack(side="left")
+        tk.Label(credits, text=f"Версия {VERSION} · Автор программы: {AUTHOR} ·", bg=BG, fg=MUTED,
+                 font=(FONT, 8)).pack(side="left")
         mail = tk.Label(credits, text=AUTHOR_EMAIL, bg=BG, fg=ACCENT, font=(FONT, 8, "underline"), cursor="hand2")
         mail.pack(side="left", padx=4)
         mail.bind("<Button-1>", lambda e: open_path("mailto:" + AUTHOR_EMAIL))
