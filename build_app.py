@@ -26,8 +26,8 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("Ноты из записи")]
 [assembly: AssemblyProduct("Ноты из записи")]
-[assembly: AssemblyCompany("astramixofficial@gmail.com")]
-[assembly: AssemblyCopyright("Автор: astramixofficial@gmail.com")]
+[assembly: AssemblyCompany("Астрамикс")]
+[assembly: AssemblyCopyright("Автор: Астрамикс, astramixofficial@gmail.com")]
 [assembly: AssemblyVersion("1.0.0.0")]
 
 class Launcher {

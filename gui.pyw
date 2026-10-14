@@ -23,6 +23,7 @@ OUT = ROOT / "out"
 LOG_FILE = ROOT / "gui_log.txt"
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 TITLE = "Ноты из записи"
+AUTHOR = "Астрамикс"
 AUTHOR_EMAIL = "astramixofficial@gmail.com"
 
 # stage -> (share of the progress bar where it starts, where it ends, typical seconds, label)
@@ -365,7 +366,7 @@ class App:
 
         credits = tk.Frame(root, bg=BG)
         credits.pack(side="bottom", fill="x", padx=24, pady=(0, 12))
-        tk.Label(credits, text="Автор программы:", bg=BG, fg=MUTED, font=(FONT, 8)).pack(side="left")
+        tk.Label(credits, text=f"Автор программы: {AUTHOR} ·", bg=BG, fg=MUTED, font=(FONT, 8)).pack(side="left")
         mail = tk.Label(credits, text=AUTHOR_EMAIL, bg=BG, fg=ACCENT, font=(FONT, 8, "underline"), cursor="hand2")
         mail.pack(side="left", padx=4)
         mail.bind("<Button-1>", lambda e: open_path("mailto:" + AUTHOR_EMAIL))

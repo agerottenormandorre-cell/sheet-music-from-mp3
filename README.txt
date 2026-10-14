@@ -46,4 +46,4 @@
 
 Автор
 -----
-  astramixofficial@gmail.com — по любым вопросам и предложениям.
+  Астрамикс, astramixofficial@gmail.com — по любым вопросам и предложениям.
