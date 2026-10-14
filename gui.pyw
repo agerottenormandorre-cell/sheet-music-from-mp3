@@ -23,6 +23,7 @@ OUT = ROOT / "out"
 LOG_FILE = ROOT / "gui_log.txt"
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 TITLE = "Ноты из записи"
+AUTHOR_EMAIL = "astramixofficial@gmail.com"
 
 # stage -> (share of the progress bar where it starts, where it ends, typical seconds, label)
 STAGES = {
@@ -362,8 +363,16 @@ class App:
                      highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT).pack(side="left", padx=4)
             tk.Label(frag, text=label, bg=BG, fg=MUTED, font=(FONT, 9)).pack(side="left")
 
+        credits = tk.Frame(root, bg=BG)
+        credits.pack(side="bottom", fill="x", padx=24, pady=(0, 12))
+        tk.Label(credits, text="Автор программы:", bg=BG, fg=MUTED, font=(FONT, 8)).pack(side="left")
+        mail = tk.Label(credits, text=AUTHOR_EMAIL, bg=BG, fg=ACCENT, font=(FONT, 8, "underline"), cursor="hand2")
+        mail.pack(side="left", padx=4)
+        mail.bind("<Button-1>", lambda e: open_path("mailto:" + AUTHOR_EMAIL))
+        tk.Label(credits, text="— по любым вопросам и предложениям", bg=BG, fg=MUTED, font=(FONT, 8)).pack(side="left")
+
         foot = tk.Frame(root, bg=BG)
-        foot.pack(side="bottom", fill="x", padx=24, pady=(6, 16))
+        foot.pack(side="bottom", fill="x", padx=24, pady=(6, 6))
         self.state = tk.Label(foot, text="Загружаю библиотеки…", bg=BG, fg=MUTED, font=(FONT, 9))
         self.state.pack(side="left")
         Button(foot, "Все результаты", lambda: (OUT.mkdir(exist_ok=True), open_path(OUT))).pack(side="right")
